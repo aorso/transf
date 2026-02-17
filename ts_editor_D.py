@@ -435,21 +435,32 @@ class _TermSheetEditor:
             if target.runs:
                 self._copy_run_format(target.runs[-1], new_p.runs[0])
         else:
-            new_p = self.doc.add_paragraph(text)
-            last_run, last_para = self._get_last_run_and_paragraph_before(new_p._element)
+            # Créer un paragraphe temporaire pour trouver la position
+            temp_p = self.doc.add_paragraph()
+            last_run, last_para = self._get_last_run_and_paragraph_before(temp_p._element)
             
-            # Copier les propriétés de paragraphe (pPr) pour alignement, espacement, etc.
+            # Supprimer le paragraphe temporaire
+            temp_p._element.getparent().remove(temp_p._element)
+            
+            # Cloner le dernier paragraphe (structure complète + style) puis modifier le texte
             if last_para is not None:
-                src_ppr = last_para._element.find(qn("w:pPr"))
-                dst_ppr = new_p._element.find(qn("w:pPr"))
-                if dst_ppr is not None:
-                    new_p._element.remove(dst_ppr)
-                if src_ppr is not None:
-                    new_p._element.insert(0, deepcopy(src_ppr))
-            
-            # Copier le format de run (police, taille, couleur, etc.) via w:rPr XML
-            if last_run is not None and new_p.runs:
-                self._copy_run_format(last_run, new_p.runs[0])
+                new_p_elem = deepcopy(last_para._element)
+                self.doc.element.body.append(new_p_elem)
+                
+                # Récupérer l'objet Paragraph python-docx
+                new_p = None
+                for p in self.doc.paragraphs:
+                    if p._element is new_p_elem:
+                        new_p = p
+                        break
+                
+                # Remplacer le texte (supprimer tous les runs et en créer un nouveau)
+                for run in list(new_p.runs):
+                    run._element.getparent().remove(run._element)
+                new_p.add_run(text)
+            else:
+                # Fallback : créer un paragraphe normal si aucun paragraphe précédent
+                new_p = self.doc.add_paragraph(text)
         for run in new_p.runs:
             if highlight:
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
