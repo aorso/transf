@@ -377,6 +377,9 @@ class _TermSheetEditor:
 
     def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str):
         """Clone la ligne (format exact), modifie uniquement le texte (w:t) sans toucher pPr/rPr."""
+        from docx.oxml.ns import nsmap
+        w_ns = nsmap['w']
+        
         tbl = table._tbl
         ref_tr = ref_row._tr
         new_tr = deepcopy(ref_tr)
@@ -387,13 +390,13 @@ class _TermSheetEditor:
         
         for i, text in enumerate(texts[: len(tcs)]):
             tc = tcs[i]
-            t_elements = tc.findall(qn(".//w:t"))
+            t_elements = tc.findall(f".//{{{w_ns}}}t")
             if t_elements:
                 t_elements[0].text = text
                 for extra_t in t_elements[1:]:
                     extra_t.text = ""
             if self.markup_mode:
-                for r_elem in tc.findall(qn(".//w:r")):
+                for r_elem in tc.findall(f".//{{{w_ns}}}r"):
                     rpr = r_elem.find(qn("w:rPr"))
                     if rpr is None:
                         rpr = OxmlElement("w:rPr")
