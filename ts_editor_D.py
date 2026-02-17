@@ -376,58 +376,23 @@ class _TermSheetEditor:
         return None
 
     def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str):
-        """Crée une nouvelle ligne minimale (sans dupliquer la structure de la référence)."""
+        """Clone la ligne de référence (format exact), puis remplace le contenu."""
         tbl = table._tbl
         ref_tr = ref_row._tr
-        ref_cells = ref_row.cells
-        texts = [new_title, new_description] if len(ref_cells) >= 2 else [f"{new_title}\n{new_description}"]
-
-        new_tr = OxmlElement("w:tr")
-        ref_trpr = ref_tr.find(qn("w:trPr"))
-        if ref_trpr is not None:
-            new_tr.append(deepcopy(ref_trpr))
-
-        for i, text in enumerate(texts[: len(ref_cells)]):
-            ref_cell = ref_cells[i]
-            ref_tc = ref_cell._tc
-            new_tc = OxmlElement("w:tc")
-            ref_tcpr = ref_tc.find(qn("w:tcPr"))
-            if ref_tcpr is not None:
-                new_tc.append(deepcopy(ref_tcpr))
-
-            new_p = OxmlElement("w:p")
-            ref_para = ref_cell.paragraphs[0] if ref_cell.paragraphs else None
-            ref_ppr = ref_para._element.find(qn("w:pPr")) if ref_para is not None else None
-            if ref_ppr is not None:
-                new_p.append(deepcopy(ref_ppr))
-
-            new_r = OxmlElement("w:r")
-            ref_rpr = None
-            if ref_cell.paragraphs and ref_cell.paragraphs[0].runs:
-                ref_rpr = ref_cell.paragraphs[0].runs[0]._element.find(qn("w:rPr"))
-            if ref_rpr is not None:
-                new_r.append(deepcopy(ref_rpr))
-
-            new_t = OxmlElement("w:t")
-            new_t.text = text
-            new_r.append(new_t)
-            new_p.append(new_r)
-            new_tc.append(new_p)
-            new_tr.append(new_tc)
-
-            if self.markup_mode:
-                rpr = new_r.find(qn("w:rPr"))
-                if rpr is None:
-                    rpr = OxmlElement("w:rPr")
-                    new_r.insert(0, rpr)
-                hl = OxmlElement("w:highlight")
-                hl.set(qn("w:val"), "yellow")
-                rpr.append(hl)
-
+        new_tr = deepcopy(ref_tr)
         ref_tr.addnext(new_tr)
         tr_list = list(tbl)
         ref_idx = tr_list.index(ref_tr)
-        return table.rows[ref_idx + 1]
+        new_row = table.rows[ref_idx + 1]
+
+        if len(new_row.cells) >= 2:
+            self._set_cell_text(new_row.cells[0], new_title, highlight=self.markup_mode)
+            self._set_cell_text(new_row.cells[1], new_description, highlight=self.markup_mode)
+        elif len(new_row.cells) == 1:
+            self._set_cell_text(
+                new_row.cells[0], f"{new_title}\n{new_description}", highlight=self.markup_mode
+            )
+        return new_row
 
     def add_content(
         self,
@@ -454,17 +419,27 @@ class _TermSheetEditor:
                 self._copy_run_format(target.runs[-1], new_p.runs[0])
         else:
             new_p = self.doc.add_paragraph(text)
-            last_ppr, last_rpr = self._get_last_paragraph_and_run_pr_before(new_p._element)
-            if last_ppr is not None:
+            last_run, last_para = self._get_last_run_and_paragraph_before(new_p._element)
+            if last_para is not None:
                 new_ppr = new_p._element.find(qn("w:pPr"))
                 if new_ppr is not None:
                     new_p._element.remove(new_ppr)
-                new_p._element.insert(0, deepcopy(last_ppr))
-            if last_rpr is not None and new_p.runs:
-                dst_rpr = new_p.runs[0]._element.find(qn("w:rPr"))
-                if dst_rpr is not None:
-                    new_p.runs[0]._element.remove(dst_rpr)
-                new_p.runs[0]._element.insert(0, deepcopy(last_rpr))
+                ref_ppr = last_para._element.find(qn("w:pPr"))
+                if ref_ppr is not None:
+                    new_p._element.insert(0, deepcopy(ref_ppr))
+                else:
+                    try:
+                        style_id = getattr(last_para.style, "style_id", None) or getattr(last_para.style, "name", None)
+                        if style_id:
+                            ppr = OxmlElement("w:pPr")
+                            pStyle = OxmlElement("w:pStyle")
+                            pStyle.set(qn("w:val"), style_id)
+                            ppr.append(pStyle)
+                            new_p._element.insert(0, ppr)
+                    except (AttributeError, KeyError):
+                        pass
+            if last_run is not None and new_p.runs:
+                self._copy_run_format_from_api(last_run, new_p.runs[0])
         for run in new_p.runs:
             if highlight:
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
@@ -474,48 +449,60 @@ class _TermSheetEditor:
                 run.font.highlight_color = None
         return self
 
-    def _get_last_paragraph_and_run_pr_before(self, exclude_element):
-        """Retourne (pPr, rPr) du dernier bloc de contenu avant l'élément exclu."""
+    def _get_last_run_and_paragraph_before(self, exclude_element):
+        """Retourne (dernier Run, dernier Paragraph) avant l'élément exclu (objets python-docx)."""
         body = self.doc.element.body
-        last_ppr, last_rpr = None, None
-        for block in body:
-            if block is exclude_element:
-                break
-            if block.tag == qn("w:p"):
-                last_ppr = block.find(qn("w:pPr"))
-                runs = block.findall(qn("w:r"))
-                if runs:
-                    rpr = runs[-1].find(qn("w:rPr"))
-                    if rpr is not None:
-                        last_rpr = rpr
-            elif block.tag == qn("w:tbl"):
-                ppr, rpr = self._get_last_ppr_rpr_in_tbl(block)
-                if ppr is not None:
-                    last_ppr = ppr
-                if rpr is not None:
-                    last_rpr = rpr
-        return last_ppr, last_rpr
+        last_run, last_para = None, None
+        try:
+            idx = list(body).index(exclude_element)
+        except ValueError:
+            idx = len(body)
+        blocks_before = list(body)[:idx]
 
-    def _get_last_ppr_rpr_in_tbl(self, tbl_elem):
-        """Dernier (pPr, rPr) dans un tableau (parcours récursif)."""
-        last_ppr, last_rpr = None, None
-        for tc in tbl_elem.findall(qn("w:tr")):
-            for cell in tc.findall(qn("w:tc")):
-                for p in cell.findall(qn("w:p")):
-                    ppr = p.find(qn("w:pPr"))
-                    if ppr is not None:
-                        last_ppr = ppr
-                    for r in p.findall(qn("w:r")):
-                        rpr = r.find(qn("w:rPr"))
-                        if rpr is not None:
-                            last_rpr = rpr
-                for nested_tbl in cell.findall(qn("w:tbl")):
-                    ppr, rpr = self._get_last_ppr_rpr_in_tbl(nested_tbl)
-                    if ppr is not None:
-                        last_ppr = ppr
-                    if rpr is not None:
-                        last_rpr = rpr
-        return last_ppr, last_rpr
+        for block in reversed(blocks_before):
+            if block.tag == qn("w:p"):
+                for p in self.doc.paragraphs:
+                    if p._element is block:
+                        last_para = p
+                        last_run = p.runs[-1] if p.runs else None
+                        return last_run, last_para
+            elif block.tag == qn("w:tbl"):
+                for table in self.doc.tables:
+                    if table._tbl is block:
+                        run, para = self._get_last_run_para_in_table(table)
+                        return (run, para) if (run or para) else (last_run, last_para)
+        return last_run, last_para
+
+    def _get_last_run_para_in_table(self, table):
+        """Dernier (Run, Paragraph) dans un tableau (objets python-docx)."""
+        last_run, last_para = None, None
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    last_para = p
+                    last_run = p.runs[-1] if p.runs else None
+                for nested in cell.tables:
+                    r, p = self._get_last_run_para_in_table(nested)
+                    if r is not None:
+                        last_run = r
+                    if p is not None:
+                        last_para = p
+        return last_run, last_para
+
+    def _copy_run_format_from_api(self, src_run, dst_run):
+        """Copie le format via l'API python-docx (gère l'héritage des styles)."""
+        try:
+            dst_run.bold = src_run.bold
+            dst_run.italic = src_run.italic
+            dst_run.underline = src_run.underline
+            if src_run.font.name:
+                dst_run.font.name = src_run.font.name
+            if src_run.font.size:
+                dst_run.font.size = src_run.font.size
+            if src_run.font.color and src_run.font.color.rgb:
+                dst_run.font.color.rgb = src_run.font.color.rgb
+        except (AttributeError, TypeError):
+            pass
 
     def remove_paragraph(self, text_contains: str, occurrence: int = 1):
         """Supprime un paragraphe hors tableau contenant le texte donné.
