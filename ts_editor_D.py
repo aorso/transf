@@ -437,20 +437,19 @@ class _TermSheetEditor:
         else:
             new_p = self.doc.add_paragraph(text)
             last_run, last_para = self._get_last_run_and_paragraph_before(new_p._element)
+            
+            # Copier les propriétés de paragraphe (pPr) pour alignement, espacement, etc.
             if last_para is not None:
-                try:
-                    new_p.style = last_para.style
-                except:
-                    pass
+                src_ppr = last_para._element.find(qn("w:pPr"))
+                dst_ppr = new_p._element.find(qn("w:pPr"))
+                if dst_ppr is not None:
+                    new_p._element.remove(dst_ppr)
+                if src_ppr is not None:
+                    new_p._element.insert(0, deepcopy(src_ppr))
+            
+            # Copier le format de run (police, taille, couleur, etc.) via w:rPr XML
             if last_run is not None and new_p.runs:
-                dst = new_p.runs[0]
-                dst.font.name = last_run.font.name
-                dst.font.size = last_run.font.size
-                if last_run.font.color.rgb:
-                    dst.font.color.rgb = last_run.font.color.rgb
-                dst.font.bold = last_run.font.bold
-                dst.font.italic = last_run.font.italic
-                dst.font.underline = last_run.font.underline
+                self._copy_run_format(last_run, new_p.runs[0])
         for run in new_p.runs:
             if highlight:
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
