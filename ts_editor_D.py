@@ -396,6 +396,11 @@ class _TermSheetEditor:
                 new_tc.append(deepcopy(ref_tcpr))
 
             new_p = OxmlElement("w:p")
+            ref_para = ref_cell.paragraphs[0] if ref_cell.paragraphs else None
+            ref_ppr = ref_para._element.find(qn("w:pPr")) if ref_para is not None else None
+            if ref_ppr is not None:
+                new_p.append(deepcopy(ref_ppr))
+
             new_r = OxmlElement("w:r")
             ref_rpr = None
             if ref_cell.paragraphs and ref_cell.paragraphs[0].runs:
@@ -439,8 +444,27 @@ class _TermSheetEditor:
             new_p = self.doc.add_paragraph(text)
             new_p._element.getparent().remove(new_p._element)
             target._element.addnext(new_p._element)
+            target_ppr = target._element.find(qn("w:pPr"))
+            if target_ppr is not None:
+                new_ppr = new_p._element.find(qn("w:pPr"))
+                if new_ppr is not None:
+                    new_p._element.remove(new_ppr)
+                new_p._element.insert(0, deepcopy(target_ppr))
+            if target.runs:
+                self._copy_run_format(target.runs[-1], new_p.runs[0])
         else:
             new_p = self.doc.add_paragraph(text)
+            last_ppr, last_rpr = self._get_last_paragraph_and_run_pr_before(new_p._element)
+            if last_ppr is not None:
+                new_ppr = new_p._element.find(qn("w:pPr"))
+                if new_ppr is not None:
+                    new_p._element.remove(new_ppr)
+                new_p._element.insert(0, deepcopy(last_ppr))
+            if last_rpr is not None and new_p.runs:
+                dst_rpr = new_p.runs[0]._element.find(qn("w:rPr"))
+                if dst_rpr is not None:
+                    new_p.runs[0]._element.remove(dst_rpr)
+                new_p.runs[0]._element.insert(0, deepcopy(last_rpr))
         for run in new_p.runs:
             if highlight:
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
@@ -449,6 +473,49 @@ class _TermSheetEditor:
             elif not self.markup_mode:
                 run.font.highlight_color = None
         return self
+
+    def _get_last_paragraph_and_run_pr_before(self, exclude_element):
+        """Retourne (pPr, rPr) du dernier bloc de contenu avant l'élément exclu."""
+        body = self.doc.element.body
+        last_ppr, last_rpr = None, None
+        for block in body:
+            if block is exclude_element:
+                break
+            if block.tag == qn("w:p"):
+                last_ppr = block.find(qn("w:pPr"))
+                runs = block.findall(qn("w:r"))
+                if runs:
+                    rpr = runs[-1].find(qn("w:rPr"))
+                    if rpr is not None:
+                        last_rpr = rpr
+            elif block.tag == qn("w:tbl"):
+                ppr, rpr = self._get_last_ppr_rpr_in_tbl(block)
+                if ppr is not None:
+                    last_ppr = ppr
+                if rpr is not None:
+                    last_rpr = rpr
+        return last_ppr, last_rpr
+
+    def _get_last_ppr_rpr_in_tbl(self, tbl_elem):
+        """Dernier (pPr, rPr) dans un tableau (parcours récursif)."""
+        last_ppr, last_rpr = None, None
+        for tc in tbl_elem.findall(qn("w:tr")):
+            for cell in tc.findall(qn("w:tc")):
+                for p in cell.findall(qn("w:p")):
+                    ppr = p.find(qn("w:pPr"))
+                    if ppr is not None:
+                        last_ppr = ppr
+                    for r in p.findall(qn("w:r")):
+                        rpr = r.find(qn("w:rPr"))
+                        if rpr is not None:
+                            last_rpr = rpr
+                for nested_tbl in cell.findall(qn("w:tbl")):
+                    ppr, rpr = self._get_last_ppr_rpr_in_tbl(nested_tbl)
+                    if ppr is not None:
+                        last_ppr = ppr
+                    if rpr is not None:
+                        last_rpr = rpr
+        return last_ppr, last_rpr
 
     def remove_paragraph(self, text_contains: str, occurrence: int = 1):
         """Supprime un paragraphe hors tableau contenant le texte donné.
