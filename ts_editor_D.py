@@ -13,14 +13,74 @@ Règles de marquage :
 - Suppression : texte barré (conservé pour trace)
 """
 
+import subprocess
+import shutil
+import tempfile
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 from docx.shared import Inches
+
+
+# -----------------------------------------------------------------------------
+# Conversion .doc → .docx
+# -----------------------------------------------------------------------------
+
+def _strip_all_highlights(doc: Document, keep_red: bool = True) -> None:
+    """Supprime tout surlignage du document. Si keep_red=True, conserve le surlignage rouge."""
+    def clear_run(r):
+        if keep_red and r.font.highlight_color == WD_COLOR_INDEX.RED:
+            return
+        r.font.highlight_color = None
+
+    for p in doc.paragraphs:
+        for r in p.runs:
+            clear_run(r)
+    for table in doc.tables:
+        _strip_highlights_in_table(table, clear_run)
+
+
+def _strip_highlights_in_table(table, clear_run) -> None:
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                for r in p.runs:
+                    clear_run(r)
+            for nested in cell.tables:
+                _strip_highlights_in_table(nested, clear_run)
+
+
+def _convert_doc_to_docx(doc_path: Path) -> Tuple[Path, Path]:
+    """Convertit un fichier .doc en .docx via LibreOffice. Retourne (chemin_docx, temp_dir à nettoyer)."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="ts_transformer_"))
+    cmd = None
+    for exe in ("soffice", "libreoffice"):
+        found = shutil.which(exe)
+        if found:
+            cmd = [found, "--headless", "--convert-to", "docx", "--outdir", str(tmpdir), str(doc_path)]
+            break
+    if cmd is None:
+        if Path("/Applications/LibreOffice.app/Contents/MacOS/soffice").exists():
+            cmd = ["/Applications/LibreOffice.app/Contents/MacOS/soffice", "--headless",
+                   "--convert-to", "docx", "--outdir", str(tmpdir), str(doc_path)]
+        else:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise RuntimeError(
+                "Conversion .doc requiert LibreOffice. Installez LibreOffice ou convertissez manuellement en .docx."
+            )
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError(f"Erreur conversion LibreOffice : {result.stderr or result.stdout}")
+    docx_path = tmpdir / (doc_path.stem + ".docx")
+    if not docx_path.exists():
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("LibreOffice n'a pas généré de fichier .docx")
+    return docx_path, tmpdir
 
 
 # -----------------------------------------------------------------------------
@@ -62,8 +122,31 @@ class AddLogoOp:
     all_sections: bool = True
 
 
+@dataclass
+class AddContentOp:
+    """Ajoute un titre ou une description (paragraphe hors tableau)."""
+    text: str
+    after_paragraph: Optional[str] = None  # Texte du paragraphe après lequel insérer (None = fin)
+    red_highlight_in_final: bool = False
+
+
+@dataclass
+class RemoveParagraphOp:
+    """Supprime un paragraphe contenant le texte donné."""
+    text_contains: str
+    occurrence: int = 1
+
+
+@dataclass
+class UpdateParagraphOp:
+    """Modifie le contenu d'un paragraphe."""
+    text_contains: str
+    new_text: str
+    occurrence: int = 1
+
+
 # -----------------------------------------------------------------------------
-# Éditeur de base (logique version C + logo version A)
+# Éditeur de base
 # -----------------------------------------------------------------------------
 
 class _TermSheetEditor:
@@ -176,8 +259,9 @@ class _TermSheetEditor:
         dst_run.font.size = src_run.font.size
         if src_run.font.color is not None and src_run.font.color.rgb is not None:
             dst_run.font.color.rgb = src_run.font.color.rgb
+        # Version finale : pas de surlignage
         if not self.markup_mode:
-            dst_run.font.highlight_color = src_run.font.highlight_color
+            dst_run.font.highlight_color = None
 
     def update_section_description(self, section_title: str, new_description: str, occurrence: int = 1):
         row, table = self._find_section_row(section_title, occurrence)
@@ -222,7 +306,7 @@ class _TermSheetEditor:
             )
         return self
 
-    def _set_cell_text(self, cell, text: str, highlight: bool = False):
+    def _set_cell_text(self, cell, text: str, highlight: bool = False, red_highlight: bool = False):
         if not cell.paragraphs:
             cell.add_paragraph("")
         p = cell.paragraphs[0]
@@ -231,6 +315,10 @@ class _TermSheetEditor:
             ref_run.text = text
             if highlight:
                 ref_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            elif red_highlight:
+                ref_run.font.highlight_color = WD_COLOR_INDEX.RED
+            elif not self.markup_mode:
+                ref_run.font.highlight_color = None
             for r in p.runs[1:]:
                 r.text = ""
             for extra_p in cell.paragraphs[1:]:
@@ -239,6 +327,10 @@ class _TermSheetEditor:
             r = p.add_run(text)
             if highlight:
                 r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            elif red_highlight:
+                r.font.highlight_color = WD_COLOR_INDEX.RED
+            elif not self.markup_mode:
+                r.font.highlight_color = None
 
     def _normalize(self, s: str) -> str:
         return " ".join((s or "").replace("\n", " ").split()).strip()
@@ -288,15 +380,81 @@ class _TermSheetEditor:
         ref_idx = tr_list.index(ref_tr)
         return table.rows[ref_idx + 1]
 
+    def add_content(
+        self,
+        text: str,
+        after_paragraph: Optional[str] = None,
+        highlight: bool = False,
+        red_highlight: bool = False,
+    ):
+        """Ajoute un paragraphe (titre/description) hors tableau."""
+        if after_paragraph:
+            target = self._find_body_paragraph(after_paragraph, occurrence=1)
+            if target is None:
+                raise ValueError(f"Paragraphe introuvable contenant : {after_paragraph!r}")
+            new_p = self.doc.add_paragraph(text)
+            new_p._element.getparent().remove(new_p._element)
+            target._element.addnext(new_p._element)
+        else:
+            new_p = self.doc.add_paragraph(text)
+        for run in new_p.runs:
+            if highlight:
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            elif red_highlight:
+                run.font.highlight_color = WD_COLOR_INDEX.RED
+            elif not self.markup_mode:
+                run.font.highlight_color = None
+        return self
+
+    def remove_paragraph(self, text_contains: str, occurrence: int = 1):
+        """Supprime un paragraphe hors tableau contenant le texte donné.
+        Mode mark-up : barre le texte au lieu de le supprimer."""
+        target = self._find_body_paragraph(text_contains, occurrence)
+        if target is None:
+            raise ValueError(f"Paragraphe introuvable contenant : {text_contains!r}")
+        if self.markup_mode:
+            for run in target.runs:
+                run.font.strike = True
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        else:
+            target._element.getparent().remove(target._element)
+        return self
+
+    def update_paragraph(self, text_contains: str, new_text: str, occurrence: int = 1):
+        """Modifie le contenu d'un paragraphe hors tableau.
+        Mode mark-up : surligne le nouveau texte en jaune."""
+        target = self._find_body_paragraph(text_contains, occurrence)
+        if target is None:
+            raise ValueError(f"Paragraphe introuvable contenant : {text_contains!r}")
+        target.clear()
+        run = target.add_run(new_text)
+        if self.markup_mode:
+            run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        return self
+
+    def _find_body_paragraph(self, text_contains: str, occurrence: int = 1):
+        """Trouve le n-ième paragraphe du body (hors tableaux) contenant le texte."""
+        count = 0
+        for p in self.doc.paragraphs:
+            if text_contains in p.text:
+                count += 1
+                if count == occurrence:
+                    return p
+        return None
+
     def add_logo_to_header(self, logo_path: str, width_inches: float = 1.0, all_sections: bool = True) -> bool:
+        """Supprime le header existant et place uniquement le logo en haut à gauche."""
         try:
             sections = self.doc.sections if all_sections else [self.doc.sections[0]]
             for section in sections:
                 header = section.header
-                if not header.paragraphs:
-                    paragraph = header.add_paragraph()
-                else:
-                    paragraph = header.paragraphs[0]
+                # Supprimer tout le contenu du header
+                for paragraph in list(header.paragraphs):
+                    paragraph._element.getparent().remove(paragraph._element)
+                for table in list(header.tables):
+                    table._element.getparent().remove(table._element)
+                # Nouveau paragraphe avec uniquement le logo
+                paragraph = header.add_paragraph()
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 run = paragraph.add_run()
                 run.add_picture(logo_path, width=Inches(width_inches))
@@ -332,10 +490,22 @@ class TermSheetTransformer:
     """
 
     def __init__(self, docx_path: str):
-        self.docx_path = Path(docx_path)
-        if not self.docx_path.exists():
+        self._temp_dir: Optional[Path] = None
+        path = Path(docx_path)
+        if not path.exists():
             raise FileNotFoundError(f"Fichier introuvable : {docx_path}")
+        if path.suffix.lower() == ".doc":
+            self.docx_path, self._temp_dir = _convert_doc_to_docx(path)
+        else:
+            self.docx_path = path
         self.operations: List = []
+
+    def __del__(self):
+        if hasattr(self, "_temp_dir") and self._temp_dir is not None and self._temp_dir.exists():
+            try:
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     def replace_word(self, old: str, new: str, occurrence: int = 1) -> "TermSheetTransformer":
         self.operations.append(ReplaceOp(old=old, new=new, occurrence=occurrence))
@@ -363,6 +533,27 @@ class TermSheetTransformer:
                  all_sections: bool = True) -> "TermSheetTransformer":
         self.operations.append(AddLogoOp(
             logo_path=logo_path, width_inches=width_inches, all_sections=all_sections
+        ))
+        return self
+
+    def add_content(self, text: str, after_paragraph: Optional[str] = None,
+                    red_highlight_in_final: bool = False) -> "TermSheetTransformer":
+        """Ajoute un titre ou une description (paragraphe hors tableau)."""
+        self.operations.append(AddContentOp(
+            text=text, after_paragraph=after_paragraph, red_highlight_in_final=red_highlight_in_final
+        ))
+        return self
+
+    def remove_paragraph(self, text_contains: str, occurrence: int = 1) -> "TermSheetTransformer":
+        """Supprime un paragraphe contenant le texte donné."""
+        self.operations.append(RemoveParagraphOp(text_contains=text_contains, occurrence=occurrence))
+        return self
+
+    def update_paragraph(self, text_contains: str, new_text: str,
+                         occurrence: int = 1) -> "TermSheetTransformer":
+        """Modifie le contenu d'un paragraphe."""
+        self.operations.append(UpdateParagraphOp(
+            text_contains=text_contains, new_text=new_text, occurrence=occurrence
         ))
         return self
 
@@ -413,12 +604,30 @@ class TermSheetTransformer:
                 editor_final.add_logo_to_header(
                     op.logo_path, op.width_inches, op.all_sections
                 )
+            elif isinstance(op, AddContentOp):
+                editor_markup.add_content(
+                    op.text, op.after_paragraph,
+                    highlight=True,  # jaune en mark-up
+                    red_highlight=False,
+                )
+                editor_final.add_content(
+                    op.text, op.after_paragraph,
+                    highlight=False,
+                    red_highlight=op.red_highlight_in_final,
+                )
+            elif isinstance(op, RemoveParagraphOp):
+                editor_markup.remove_paragraph(op.text_contains, op.occurrence)
+                editor_final.remove_paragraph(op.text_contains, op.occurrence)
+            elif isinstance(op, UpdateParagraphOp):
+                editor_markup.update_paragraph(op.text_contains, op.new_text, op.occurrence)
+                editor_final.update_paragraph(op.text_contains, op.new_text, op.occurrence)
 
         path_markup = output_dir / markup_docx
         path_final = output_dir / final_docx
         path_pdf = output_dir / final_pdf
 
         editor_markup.save(str(path_markup))
+        _strip_all_highlights(doc_final)
         editor_final.save(str(path_final))
 
         try:
@@ -438,12 +647,17 @@ class TermSheetTransformer:
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Accepte .doc (conversion auto via LibreOffice) ou .docx
     transformer = TermSheetTransformer("mon_term_sheet.docx")
 
     transformer.replace_word("Mot1", "Mot2")
     transformer.add_section_after("Listing", "Issuer", "Paul Berber")
     transformer.update_section_description("Country", "France")
     transformer.remove_section("Old Section")
+    transformer.add_content("Notice importante", red_highlight_in_final=True)
+    transformer.add_content("Paragraphe après un autre", after_paragraph="Texte existant")
+    transformer.update_paragraph("Ancien texte", "Nouveau texte")
+    transformer.remove_paragraph("Paragraphe à supprimer")
     transformer.add_logo("logo_nbc.png", width_inches=0.8)
 
     transformer.execute_and_export(
