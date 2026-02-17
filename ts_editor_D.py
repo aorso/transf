@@ -454,10 +454,15 @@ class _TermSheetEditor:
                         new_p = p
                         break
                 
-                # Remplacer le texte (supprimer tous les runs et en créer un nouveau)
-                for run in list(new_p.runs):
-                    run._element.getparent().remove(run._element)
-                new_p.add_run(text)
+                # Modifier le texte du premier run (garde le rPr avec formatage)
+                # et supprimer les runs suivants
+                if new_p.runs:
+                    new_p.runs[0].text = text
+                    for run in list(new_p.runs[1:]):
+                        run._element.getparent().remove(run._element)
+                else:
+                    # Si pas de run, en créer un (fallback)
+                    new_p.add_run(text)
             else:
                 # Fallback : créer un paragraphe normal si aucun paragraphe précédent
                 new_p = self.doc.add_paragraph(text)
