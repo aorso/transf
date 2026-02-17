@@ -376,23 +376,37 @@ class _TermSheetEditor:
         return None
 
     def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str):
-        """Clone la ligne de référence (format exact), puis remplace le contenu."""
+        """Clone la ligne (format exact), modifie uniquement le texte (w:t) sans toucher pPr/rPr."""
         tbl = table._tbl
         ref_tr = ref_row._tr
         new_tr = deepcopy(ref_tr)
         ref_tr.addnext(new_tr)
+
+        texts = [new_title, new_description] if len(ref_row.cells) >= 2 else [f"{new_title}\n{new_description}"]
+        tcs = new_tr.findall(qn("w:tc"))
+        
+        for i, text in enumerate(texts[: len(tcs)]):
+            tc = tcs[i]
+            t_elements = tc.findall(qn(".//w:t"))
+            if t_elements:
+                t_elements[0].text = text
+                for extra_t in t_elements[1:]:
+                    extra_t.text = ""
+            if self.markup_mode:
+                for r_elem in tc.findall(qn(".//w:r")):
+                    rpr = r_elem.find(qn("w:rPr"))
+                    if rpr is None:
+                        rpr = OxmlElement("w:rPr")
+                        r_elem.insert(0, rpr)
+                    hl = rpr.find(qn("w:highlight"))
+                    if hl is None:
+                        hl = OxmlElement("w:highlight")
+                        hl.set(qn("w:val"), "yellow")
+                        rpr.append(hl)
+
         tr_list = list(tbl)
         ref_idx = tr_list.index(ref_tr)
-        new_row = table.rows[ref_idx + 1]
-
-        if len(new_row.cells) >= 2:
-            self._set_cell_text(new_row.cells[0], new_title, highlight=self.markup_mode)
-            self._set_cell_text(new_row.cells[1], new_description, highlight=self.markup_mode)
-        elif len(new_row.cells) == 1:
-            self._set_cell_text(
-                new_row.cells[0], f"{new_title}\n{new_description}", highlight=self.markup_mode
-            )
-        return new_row
+        return table.rows[ref_idx + 1]
 
     def add_content(
         self,
@@ -421,25 +435,19 @@ class _TermSheetEditor:
             new_p = self.doc.add_paragraph(text)
             last_run, last_para = self._get_last_run_and_paragraph_before(new_p._element)
             if last_para is not None:
-                new_ppr = new_p._element.find(qn("w:pPr"))
-                if new_ppr is not None:
-                    new_p._element.remove(new_ppr)
-                ref_ppr = last_para._element.find(qn("w:pPr"))
-                if ref_ppr is not None:
-                    new_p._element.insert(0, deepcopy(ref_ppr))
-                else:
-                    try:
-                        style_id = getattr(last_para.style, "style_id", None) or getattr(last_para.style, "name", None)
-                        if style_id:
-                            ppr = OxmlElement("w:pPr")
-                            pStyle = OxmlElement("w:pStyle")
-                            pStyle.set(qn("w:val"), style_id)
-                            ppr.append(pStyle)
-                            new_p._element.insert(0, ppr)
-                    except (AttributeError, KeyError):
-                        pass
+                try:
+                    new_p.style = last_para.style
+                except:
+                    pass
             if last_run is not None and new_p.runs:
-                self._copy_run_format_from_api(last_run, new_p.runs[0])
+                dst = new_p.runs[0]
+                dst.font.name = last_run.font.name
+                dst.font.size = last_run.font.size
+                if last_run.font.color.rgb:
+                    dst.font.color.rgb = last_run.font.color.rgb
+                dst.font.bold = last_run.font.bold
+                dst.font.italic = last_run.font.italic
+                dst.font.underline = last_run.font.underline
         for run in new_p.runs:
             if highlight:
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
