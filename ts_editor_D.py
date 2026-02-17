@@ -280,10 +280,12 @@ class _TermSheetEditor:
 
     def _clone_row_after(self, table, ref_row):
         tbl = table._tbl
-        new_tr = deepcopy(ref_row._tr)
-        ref_row._tr.addnext(new_tr)
-        all_rows = list(table.rows)
-        ref_idx = all_rows.index(ref_row)
+        ref_tr = ref_row._tr
+        new_tr = deepcopy(ref_tr)
+        ref_tr.addnext(new_tr)
+        # Utiliser les éléments XML pour l'index (les Row peuvent être des wrappers différents)
+        tr_list = list(tbl)
+        ref_idx = tr_list.index(ref_tr)
         return table.rows[ref_idx + 1]
 
     def add_logo_to_header(self, logo_path: str, width_inches: float = 1.0, all_sections: bool = True) -> bool:
