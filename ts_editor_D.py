@@ -15,6 +15,7 @@ Règles de marquage :
 
 import subprocess
 import shutil
+import sys
 import tempfile
 from copy import deepcopy
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from typing import List, Optional, Tuple
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Inches
 
 
@@ -55,32 +58,45 @@ def _strip_highlights_in_table(table, clear_run) -> None:
 
 
 def _convert_doc_to_docx(doc_path: Path) -> Tuple[Path, Path]:
-    """Convertit un fichier .doc en .docx via LibreOffice. Retourne (chemin_docx, temp_dir à nettoyer)."""
+    """Convertit .doc en .docx. Essaie Word (Windows) puis LibreOffice."""
     tmpdir = Path(tempfile.mkdtemp(prefix="ts_transformer_"))
+    docx_path = tmpdir / (doc_path.stem + ".docx")
+
+    # 1. Windows : Microsoft Word via COM
+    if sys.platform == "win32":
+        try:
+            import win32com.client
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            doc = word.Documents.Open(str(doc_path.resolve()))
+            doc.SaveAs2(str(docx_path), FileFormat=16)  # 16 = wdFormatDocumentDefault (.docx)
+            doc.Close()
+            word.Quit()
+            if docx_path.exists():
+                return docx_path, tmpdir
+        except Exception:
+            pass
+
+    # 2. LibreOffice (soffice / libreoffice)
     cmd = None
     for exe in ("soffice", "libreoffice"):
         found = shutil.which(exe)
         if found:
             cmd = [found, "--headless", "--convert-to", "docx", "--outdir", str(tmpdir), str(doc_path)]
             break
-    if cmd is None:
-        if Path("/Applications/LibreOffice.app/Contents/MacOS/soffice").exists():
-            cmd = ["/Applications/LibreOffice.app/Contents/MacOS/soffice", "--headless",
-                   "--convert-to", "docx", "--outdir", str(tmpdir), str(doc_path)]
-        else:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise RuntimeError(
-                "Conversion .doc requiert LibreOffice. Installez LibreOffice ou convertissez manuellement en .docx."
-            )
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError(f"Erreur conversion LibreOffice : {result.stderr or result.stdout}")
-    docx_path = tmpdir / (doc_path.stem + ".docx")
-    if not docx_path.exists():
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("LibreOffice n'a pas généré de fichier .docx")
-    return docx_path, tmpdir
+    if cmd is None and Path("/Applications/LibreOffice.app/Contents/MacOS/soffice").exists():
+        cmd = ["/Applications/LibreOffice.app/Contents/MacOS/soffice", "--headless",
+               "--convert-to", "docx", "--outdir", str(tmpdir), str(doc_path)]
+    if cmd is not None:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and docx_path.exists():
+            return docx_path, tmpdir
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    raise RuntimeError(
+        "Conversion .doc impossible : ni Word (Windows) ni LibreOffice détecté. "
+        "Convertissez manuellement en .docx (Word : Fichier > Enregistrer sous > Word Document)."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -240,26 +256,22 @@ class _TermSheetEditor:
                 self._copy_run_format(runs[ridx], run)
 
     def _copy_run_format(self, src_run, dst_run):
-        dst_run.bold = src_run.bold
-        dst_run.italic = src_run.italic
-        dst_run.underline = src_run.underline
-        dst_run.font.all_caps = src_run.font.all_caps
-        dst_run.font.small_caps = src_run.font.small_caps
-        dst_run.font.strike = src_run.font.strike
-        dst_run.font.double_strike = src_run.font.double_strike
-        dst_run.font.subscript = src_run.font.subscript
-        dst_run.font.superscript = src_run.font.superscript
-        dst_run.font.shadow = src_run.font.shadow
-        dst_run.font.outline = src_run.font.outline
-        dst_run.font.rtl = src_run.font.rtl
-        dst_run.font.imprint = src_run.font.imprint
-        dst_run.font.emboss = src_run.font.emboss
-        dst_run.font.hidden = src_run.font.hidden
-        dst_run.font.name = src_run.font.name
-        dst_run.font.size = src_run.font.size
-        if src_run.font.color is not None and src_run.font.color.rgb is not None:
-            dst_run.font.color.rgb = src_run.font.color.rgb
-        # Version finale : pas de surlignage
+        """Copie le format via XML (rPr) pour préserver tous les styles, y compris hérités."""
+        src_rpr = src_run._element.find(qn("w:rPr"))
+        if src_rpr is not None:
+            dst_rpr = dst_run._element.find(qn("w:rPr"))
+            if dst_rpr is not None:
+                dst_run._element.remove(dst_rpr)
+            dst_run._element.insert(0, deepcopy(src_rpr))
+        else:
+            # Fallback : copie propriété par propriété
+            dst_run.bold = src_run.bold
+            dst_run.italic = src_run.italic
+            dst_run.underline = src_run.underline
+            dst_run.font.name = src_run.font.name
+            dst_run.font.size = src_run.font.size
+            if src_run.font.color is not None and src_run.font.color.rgb is not None:
+                dst_run.font.color.rgb = src_run.font.color.rgb
         if not self.markup_mode:
             dst_run.font.highlight_color = None
 
@@ -296,14 +308,7 @@ class _TermSheetEditor:
         ref_row, table = self._find_section_row(after_section, occurrence)
         if ref_row is None:
             raise ValueError(f"Section de référence introuvable : {after_section}")
-        new_row = self._clone_row_after(table, ref_row)
-        if len(new_row.cells) >= 2:
-            self._set_cell_text(new_row.cells[0], new_title, highlight=self.markup_mode)
-            self._set_cell_text(new_row.cells[1], new_description, highlight=self.markup_mode)
-        elif len(new_row.cells) == 1:
-            self._set_cell_text(
-                new_row.cells[0], f"{new_title}\n{new_description}", highlight=self.markup_mode
-            )
+        new_row = self._create_minimal_row_after(table, ref_row, new_title, new_description)
         return self
 
     def _set_cell_text(self, cell, text: str, highlight: bool = False, red_highlight: bool = False):
@@ -370,12 +375,51 @@ class _TermSheetEditor:
                     count += self._count_occurrences_in_table(nested, target)
         return None
 
-    def _clone_row_after(self, table, ref_row):
+    def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str):
+        """Crée une nouvelle ligne minimale (sans dupliquer la structure de la référence)."""
         tbl = table._tbl
         ref_tr = ref_row._tr
-        new_tr = deepcopy(ref_tr)
+        ref_cells = ref_row.cells
+        texts = [new_title, new_description] if len(ref_cells) >= 2 else [f"{new_title}\n{new_description}"]
+
+        new_tr = OxmlElement("w:tr")
+        ref_trpr = ref_tr.find(qn("w:trPr"))
+        if ref_trpr is not None:
+            new_tr.append(deepcopy(ref_trpr))
+
+        for i, text in enumerate(texts[: len(ref_cells)]):
+            ref_cell = ref_cells[i]
+            ref_tc = ref_cell._tc
+            new_tc = OxmlElement("w:tc")
+            ref_tcpr = ref_tc.find(qn("w:tcPr"))
+            if ref_tcpr is not None:
+                new_tc.append(deepcopy(ref_tcpr))
+
+            new_p = OxmlElement("w:p")
+            new_r = OxmlElement("w:r")
+            ref_rpr = None
+            if ref_cell.paragraphs and ref_cell.paragraphs[0].runs:
+                ref_rpr = ref_cell.paragraphs[0].runs[0]._element.find(qn("w:rPr"))
+            if ref_rpr is not None:
+                new_r.append(deepcopy(ref_rpr))
+
+            new_t = OxmlElement("w:t")
+            new_t.text = text
+            new_r.append(new_t)
+            new_p.append(new_r)
+            new_tc.append(new_p)
+            new_tr.append(new_tc)
+
+            if self.markup_mode:
+                rpr = new_r.find(qn("w:rPr"))
+                if rpr is None:
+                    rpr = OxmlElement("w:rPr")
+                    new_r.insert(0, rpr)
+                hl = OxmlElement("w:highlight")
+                hl.set(qn("w:val"), "yellow")
+                rpr.append(hl)
+
         ref_tr.addnext(new_tr)
-        # Utiliser les éléments XML pour l'index (les Row peuvent être des wrappers différents)
         tr_list = list(tbl)
         ref_idx = tr_list.index(ref_tr)
         return table.rows[ref_idx + 1]
