@@ -547,13 +547,29 @@ class _TermSheetEditor:
         texts = [new_title, new_description] if len(ref_row.cells) >= 2 else [f"{new_title}\n{new_description}"]
         tcs = new_tr.findall(qn("w:tc"))
         
-        for i, text in enumerate(texts[: len(tcs)]):
+        # Vérification robuste pour éviter index out of range
+        for i, text in enumerate(texts):
+            if i >= len(tcs):  # Sortir si plus de cellules disponibles
+                break
+            
             tc = tcs[i]
             t_elements = tc.findall(f".//{{{w_ns}}}t")
-            if t_elements:
+            
+            # Vérifier que t_elements n'est pas vide
+            if t_elements and len(t_elements) > 0:
                 t_elements[0].text = text
                 for extra_t in t_elements[1:]:
                     extra_t.text = ""
+            else:
+                # Si pas de t_elements, créer un run et un text element
+                # Trouver ou créer un paragraph dans la cellule
+                p_elem = tc.find(qn("w:p"))
+                if p_elem is not None:
+                    r_elem = OxmlElement("w:r")
+                    t_elem = OxmlElement("w:t")
+                    t_elem.text = text
+                    r_elem.append(t_elem)
+                    p_elem.append(r_elem)
             
             # Appliquer le surlignage approprié
             highlight_color = None
