@@ -126,9 +126,25 @@ class UpdateDescriptionOp:
 
 
 @dataclass
+class SetSectionOp:
+    """Ajoute ou met à jour une section (fusion add_section_after + update_section_description)."""
+    title: str
+    description: str
+    after_section: Optional[str] = None  # Si None, ajoute à la fin du tableau
+    red_highlight_in_final: bool = False
+    occurrence: int = 1
+
+
+@dataclass
 class DeleteSectionOp:
     section_title: str
     occurrence: int = 1
+
+
+@dataclass
+class SetSectionOrderOp:
+    """Définit l'ordre des sections dans le tableau."""
+    section_order: List[str]
 
 
 @dataclass
@@ -158,6 +174,41 @@ class UpdateParagraphOp:
     """Modifie le contenu d'un paragraphe."""
     text_contains: str
     new_text: str
+    occurrence: int = 1
+
+
+@dataclass
+class SetDisclaimerSectionOp:
+    """Ajoute ou met à jour une section dans la partie Disclaimer (après les tableaux)."""
+    title: str
+    content: str  # Peut contenir \n pour plusieurs paragraphes
+    after_title: Optional[str] = None  # Titre après lequel insérer (None = fin)
+    red_highlight_in_final: bool = False
+    occurrence: int = 1
+
+
+@dataclass
+class RemoveDisclaimerSectionOp:
+    """Supprime une section de disclaimer complète (titre + contenu)."""
+    title: str
+    occurrence: int = 1
+
+
+@dataclass
+class UpdateDisclaimerContentOp:
+    """Met à jour le contenu d'une section de disclaimer existante."""
+    title: str
+    new_content: str  # Peut contenir \n pour plusieurs paragraphes
+    red_highlight_in_final: bool = False
+    occurrence: int = 1
+
+
+@dataclass
+class AddDisclaimerContentOp:
+    """Ajoute du contenu à la fin d'une section de disclaimer existante."""
+    title: str
+    additional_content: str  # Peut contenir \n pour plusieurs paragraphes
+    red_highlight_in_final: bool = False
     occurrence: int = 1
 
 
@@ -311,31 +362,139 @@ class _TermSheetEditor:
         new_row = self._create_minimal_row_after(table, ref_row, new_title, new_description)
         return self
 
+    def set_section(
+        self, 
+        title: str, 
+        description: str, 
+        after_section: Optional[str] = None,
+        red_highlight: bool = False,
+        occurrence: int = 1
+    ):
+        """
+        Ajoute ou met à jour une section.
+        - Si la section existe : met à jour la description
+        - Si la section n'existe pas : l'ajoute après after_section (ou à la fin si None)
+        """
+        row, table = self._find_section_row(title, occurrence)
+        
+        if row is not None:
+            # Section existe : mise à jour de la description
+            if len(row.cells) >= 2:
+                self._set_cell_text(
+                    row.cells[1], 
+                    description, 
+                    highlight=self.markup_mode,
+                    red_highlight=red_highlight and not self.markup_mode
+                )
+            elif len(row.cells) == 1:
+                norm_title = self._normalize(row.cells[0].text)
+                self._set_cell_text(
+                    row.cells[0], 
+                    f"{norm_title}: {description}",
+                    highlight=self.markup_mode,
+                    red_highlight=red_highlight and not self.markup_mode
+                )
+        else:
+            # Section n'existe pas : ajout
+            if after_section:
+                # Ajouter après une section spécifique
+                ref_row, table = self._find_section_row(after_section, occurrence)
+                if ref_row is None:
+                    raise ValueError(f"Section de référence introuvable : {after_section}")
+                self._create_minimal_row_after(table, ref_row, title, description, red_highlight)
+            else:
+                # Ajouter à la fin du premier tableau
+                if not self.doc.tables:
+                    raise ValueError("Aucun tableau trouvé dans le document")
+                table = self.doc.tables[0]
+                if not table.rows:
+                    raise ValueError("Le tableau est vide")
+                # Utiliser la dernière ligne comme référence
+                last_row = table.rows[-1]
+                self._create_minimal_row_after(table, last_row, title, description, red_highlight)
+        return self
+
+    def set_section_order(self, section_order: List[str]):
+        """
+        Réorganise les lignes du tableau pour respecter l'ordre des sections spécifié.
+        Les sections non listées sont placées à la fin.
+        """
+        if not self.doc.tables:
+            return self
+        
+        table = self.doc.tables[0]
+        rows_data = []
+        
+        # Récupérer toutes les lignes avec leur titre normalisé
+        for row in table.rows:
+            if len(row.cells) >= 1:
+                title = self._normalize(row.cells[0].text)
+                rows_data.append((title, row))
+        
+        # Trier selon l'ordre spécifié
+        def get_order_index(item):
+            title = item[0]
+            try:
+                return section_order.index(title)
+            except ValueError:
+                return len(section_order)  # Placer à la fin si non spécifié
+        
+        sorted_rows = sorted(rows_data, key=get_order_index)
+        
+        # Réorganiser les lignes dans le tableau
+        tbl = table._tbl
+        for title, row in sorted_rows:
+            tbl.append(row._tr)
+        
+        return self
+
     def _set_cell_text(self, cell, text: str, highlight: bool = False, red_highlight: bool = False):
+        """
+        Définit le texte d'une cellule en gérant les retours à la ligne (\n).
+        """
+        # Gérer les retours à la ligne
+        lines = text.split('\n')
+        
         if not cell.paragraphs:
             cell.add_paragraph("")
+        
+        # Supprimer tous les paragraphes sauf le premier
+        for extra_p in cell.paragraphs[1:]:
+            extra_p._element.getparent().remove(extra_p._element)
+        
+        # Premier paragraphe avec la première ligne
         p = cell.paragraphs[0]
         if p.runs:
             ref_run = p.runs[0]
-            ref_run.text = text
+            ref_run.text = lines[0] if lines else ""
             if highlight:
                 ref_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
             elif red_highlight:
                 ref_run.font.highlight_color = WD_COLOR_INDEX.RED
             elif not self.markup_mode:
                 ref_run.font.highlight_color = None
+            # Supprimer les autres runs
             for r in p.runs[1:]:
                 r.text = ""
-            for extra_p in cell.paragraphs[1:]:
-                extra_p._element.getparent().remove(extra_p._element)
         else:
-            r = p.add_run(text)
+            r = p.add_run(lines[0] if lines else "")
             if highlight:
                 r.font.highlight_color = WD_COLOR_INDEX.YELLOW
             elif red_highlight:
                 r.font.highlight_color = WD_COLOR_INDEX.RED
             elif not self.markup_mode:
                 r.font.highlight_color = None
+        
+        # Ajouter les lignes suivantes comme nouveaux paragraphes
+        for line in lines[1:]:
+            new_p = cell.add_paragraph(line)
+            if new_p.runs:
+                if highlight:
+                    new_p.runs[0].font.highlight_color = WD_COLOR_INDEX.YELLOW
+                elif red_highlight:
+                    new_p.runs[0].font.highlight_color = WD_COLOR_INDEX.RED
+                elif not self.markup_mode:
+                    new_p.runs[0].font.highlight_color = None
 
     def _normalize(self, s: str) -> str:
         return " ".join((s or "").replace("\n", " ").split()).strip()
@@ -375,7 +534,7 @@ class _TermSheetEditor:
                     count += self._count_occurrences_in_table(nested, target)
         return None
 
-    def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str):
+    def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str, red_highlight: bool = False):
         """Clone la ligne (format exact), modifie uniquement le texte (w:t) sans toucher pPr/rPr."""
         from docx.oxml.ns import nsmap
         w_ns = nsmap['w']
@@ -395,7 +554,15 @@ class _TermSheetEditor:
                 t_elements[0].text = text
                 for extra_t in t_elements[1:]:
                     extra_t.text = ""
+            
+            # Appliquer le surlignage approprié
+            highlight_color = None
             if self.markup_mode:
+                highlight_color = "yellow"
+            elif red_highlight and i == 1:  # Surlignage rouge seulement sur la description (colonne 2)
+                highlight_color = "red"
+            
+            if highlight_color:
                 for r_elem in tc.findall(f".//{{{w_ns}}}r"):
                     rpr = r_elem.find(qn("w:rPr"))
                     if rpr is None:
@@ -404,8 +571,8 @@ class _TermSheetEditor:
                     hl = rpr.find(qn("w:highlight"))
                     if hl is None:
                         hl = OxmlElement("w:highlight")
-                        hl.set(qn("w:val"), "yellow")
                         rpr.append(hl)
+                    hl.set(qn("w:val"), highlight_color)
 
         tr_list = list(tbl)
         ref_idx = tr_list.index(ref_tr)
@@ -566,6 +733,282 @@ class _TermSheetEditor:
                     return p
         return None
 
+    # -------------------------------------------------------------------------
+    # Gestion des sections de Disclaimer (paragraphes après les tableaux)
+    # -------------------------------------------------------------------------
+
+    def _is_disclaimer_title(self, paragraph) -> bool:
+        """
+        Détecte si un paragraphe est un titre de disclaimer.
+        Critère : tous les runs en gras ET aucun souligné.
+        """
+        if not paragraph.text.strip():
+            return False
+        
+        non_empty_runs = [r for r in paragraph.runs if r.text.strip()]
+        if not non_empty_runs:
+            return False
+        
+        all_bold = all(r.bold for r in non_empty_runs)
+        no_underline = not any(r.underline for r in non_empty_runs)
+        
+        return all_bold and no_underline
+
+    def _get_last_table_index(self):
+        """Retourne l'index du dernier tableau dans le body."""
+        last_table_idx = -1
+        for i, elem in enumerate(self.doc.element.body):
+            if elem.tag.split('}')[-1] == 'tbl':
+                last_table_idx = i
+        return last_table_idx
+
+    def _get_disclaimer_paragraphs(self):
+        """Retourne tous les paragraphes après le dernier tableau."""
+        last_table_idx = self._get_last_table_index()
+        
+        disclaimer_paras = []
+        for i, elem in enumerate(self.doc.element.body):
+            if i > last_table_idx and elem.tag.split('}')[-1] == 'p':
+                for p in self.doc.paragraphs:
+                    if p._element == elem:
+                        disclaimer_paras.append(p)
+                        break
+        return disclaimer_paras
+
+    def _find_disclaimer_section(self, title: str, occurrence: int = 1):
+        """
+        Trouve une section de disclaimer par son titre.
+        Retourne: (titre_paragraph, content_paragraphs[], last_content_paragraph)
+        """
+        disclaimer_paras = self._get_disclaimer_paragraphs()
+        target = self._normalize(title)
+        
+        count = 0
+        for i, para in enumerate(disclaimer_paras):
+            if self._is_disclaimer_title(para) and self._normalize(para.text) == target:
+                count += 1
+                if count == occurrence:
+                    # Récupérer le contenu (paragraphes suivants jusqu'au prochain titre)
+                    content = []
+                    last_content = None
+                    for j in range(i + 1, len(disclaimer_paras)):
+                        if self._is_disclaimer_title(disclaimer_paras[j]):
+                            break
+                        if disclaimer_paras[j].text.strip():
+                            content.append(disclaimer_paras[j])
+                            last_content = disclaimer_paras[j]
+                    return para, content, last_content
+        
+        return None, [], None
+
+    def _get_last_disclaimer_paragraph(self):
+        """Retourne le dernier paragraphe de la zone disclaimer."""
+        disclaimer_paras = self._get_disclaimer_paragraphs()
+        return disclaimer_paras[-1] if disclaimer_paras else None
+
+    def set_disclaimer_section(
+        self,
+        title: str,
+        content: str,
+        after_title: Optional[str] = None,
+        red_highlight: bool = False,
+        occurrence: int = 1
+    ):
+        """
+        Ajoute ou met à jour une section dans la partie Disclaimer.
+        - Si la section existe : remplace le contenu
+        - Si la section n'existe pas : l'ajoute après after_title (ou à la fin)
+        
+        Le content peut contenir des \n pour séparer les paragraphes.
+        """
+        title_para, content_paras, _ = self._find_disclaimer_section(title, occurrence)
+        
+        if title_para is not None:
+            # Section existe : remplacer le contenu
+            if self.markup_mode:
+                # Barrer l'ancien contenu
+                for cp in content_paras:
+                    for r in cp.runs:
+                        r.font.strike = True
+                        r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            else:
+                # Supprimer l'ancien contenu
+                for cp in content_paras:
+                    cp._element.getparent().remove(cp._element)
+            
+            # Ajouter le nouveau contenu après le titre
+            content_lines = content.split('\n')
+            last_elem = title_para._element
+            ref_run = content_paras[0].runs[0] if content_paras and content_paras[0].runs else None
+            
+            for line in content_lines:
+                if line.strip():
+                    new_p = self.doc.add_paragraph()
+                    new_p._element.getparent().remove(new_p._element)
+                    last_elem.addnext(new_p._element)
+                    last_elem = new_p._element
+                    
+                    # Copier le format du premier paragraphe de contenu
+                    if content_paras and content_paras[0]._element.find(qn("w:pPr")) is not None:
+                        ppr = content_paras[0]._element.find(qn("w:pPr"))
+                        new_ppr = new_p._element.find(qn("w:pPr"))
+                        if new_ppr is not None:
+                            new_p._element.remove(new_ppr)
+                        new_p._element.insert(0, deepcopy(ppr))
+                    
+                    # Ajouter le texte
+                    run = new_p.add_run(line)
+                    if ref_run:
+                        self._copy_run_format(ref_run, run)
+                    
+                    # Appliquer highlighting
+                    if self.markup_mode:
+                        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                    elif red_highlight:
+                        run.font.highlight_color = WD_COLOR_INDEX.RED
+        else:
+            # Section n'existe pas : créer titre + contenu
+            if after_title:
+                ref_title_para, ref_content, last_content = self._find_disclaimer_section(after_title, 1)
+                if ref_title_para is None:
+                    raise ValueError(f"Titre de référence introuvable : {after_title}")
+                # Insérer après le dernier paragraphe de contenu de la section de référence
+                insert_after = last_content if last_content else ref_title_para
+            else:
+                # Insérer à la fin
+                insert_after = self._get_last_disclaimer_paragraph()
+                if insert_after is None:
+                    # Pas de disclaimer existant, ajouter à la fin du document
+                    insert_after = list(self.doc.paragraphs)[-1] if self.doc.paragraphs else None
+            
+            if insert_after is None:
+                raise ValueError("Impossible de trouver où insérer la section")
+            
+            # Créer le titre
+            title_para = self.doc.add_paragraph()
+            title_para._element.getparent().remove(title_para._element)
+            insert_after._element.addnext(title_para._element)
+            
+            # Mettre le titre en gras
+            title_run = title_para.add_run(title)
+            title_run.font.bold = True
+            if self.markup_mode:
+                title_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            
+            # Créer le contenu
+            content_lines = content.split('\n')
+            last_elem = title_para._element
+            for line in content_lines:
+                if line.strip():
+                    new_p = self.doc.add_paragraph()
+                    new_p._element.getparent().remove(new_p._element)
+                    last_elem.addnext(new_p._element)
+                    last_elem = new_p._element
+                    
+                    run = new_p.add_run(line)
+                    # Highlighting
+                    if self.markup_mode:
+                        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                    elif red_highlight:
+                        run.font.highlight_color = WD_COLOR_INDEX.RED
+        
+        return self
+
+    def remove_disclaimer_section(self, title: str, occurrence: int = 1):
+        """
+        Supprime une section de disclaimer complète (titre + contenu).
+        En mode mark-up : barre tout au lieu de supprimer.
+        """
+        title_para, content_paras, _ = self._find_disclaimer_section(title, occurrence)
+        if title_para is None:
+            raise ValueError(f"Section de disclaimer introuvable : {title}")
+        
+        if self.markup_mode:
+            # Barrer le titre
+            for r in title_para.runs:
+                r.font.strike = True
+                r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            # Barrer le contenu
+            for cp in content_paras:
+                for r in cp.runs:
+                    r.font.strike = True
+                    r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        else:
+            # Supprimer le titre
+            title_para._element.getparent().remove(title_para._element)
+            # Supprimer le contenu
+            for cp in content_paras:
+                cp._element.getparent().remove(cp._element)
+        
+        return self
+
+    def update_disclaimer_content(
+        self,
+        title: str,
+        new_content: str,
+        red_highlight: bool = False,
+        occurrence: int = 1
+    ):
+        """
+        Met à jour uniquement le contenu d'une section de disclaimer existante.
+        Équivalent à set_disclaimer_section mais force que la section existe.
+        """
+        title_para, content_paras, _ = self._find_disclaimer_section(title, occurrence)
+        if title_para is None:
+            raise ValueError(f"Section de disclaimer introuvable : {title}")
+        
+        # Utiliser set_disclaimer_section qui gère déjà la mise à jour
+        return self.set_disclaimer_section(title, new_content, red_highlight=red_highlight, occurrence=occurrence)
+
+    def add_disclaimer_content(
+        self,
+        title: str,
+        additional_content: str,
+        red_highlight: bool = False,
+        occurrence: int = 1
+    ):
+        """
+        Ajoute du contenu à la fin d'une section de disclaimer existante.
+        """
+        title_para, content_paras, last_content = self._find_disclaimer_section(title, occurrence)
+        if title_para is None:
+            raise ValueError(f"Section de disclaimer introuvable : {title}")
+        
+        # Trouver où insérer
+        insert_after = last_content if last_content else title_para
+        ref_run = content_paras[0].runs[0] if content_paras and content_paras[0].runs else None
+        
+        # Ajouter le nouveau contenu
+        content_lines = additional_content.split('\n')
+        last_elem = insert_after._element
+        
+        for line in content_lines:
+            if line.strip():
+                new_p = self.doc.add_paragraph()
+                new_p._element.getparent().remove(new_p._element)
+                last_elem.addnext(new_p._element)
+                last_elem = new_p._element
+                
+                # Copier le format
+                if content_paras and content_paras[0]._element.find(qn("w:pPr")) is not None:
+                    ppr = content_paras[0]._element.find(qn("w:pPr"))
+                    new_ppr = new_p._element.find(qn("w:pPr"))
+                    if new_ppr is not None:
+                        new_p._element.remove(new_ppr)
+                    new_p._element.insert(0, deepcopy(ppr))
+                
+                run = new_p.add_run(line)
+                if ref_run:
+                    self._copy_run_format(ref_run, run)
+                
+                # Highlighting
+                if self.markup_mode:
+                    run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                elif red_highlight:
+                    run.font.highlight_color = WD_COLOR_INDEX.RED
+        
+        return self
+
     def add_logo_to_header(self, logo_path: str, width_inches: float = 1.0, all_sections: bool = True) -> bool:
         """Supprime le header existant et place uniquement le logo en haut à gauche."""
         try:
@@ -603,13 +1046,39 @@ class TermSheetTransformer:
     - Document final : modifications appliquées
     - Document PDF : version PDF du final
 
+    Fonctionnalités :
+    1. Sections de tableau : Modifier les lignes du tableau principal
+    2. Paragraphes non structurés : Modifier des paragraphes individuels
+    3. Sections de Disclaimer : Modifier les sections titre/contenu après les tableaux
+    4. Logo : Ajouter un logo dans le header
+
     Exemple :
         t = TermSheetTransformer("term_sheet.docx")
+        
+        # Remplacements de mots
         t.replace_word("Mot1", "Mot2")
-        t.add_section_after("Listing", "Issuer", "Paul Berber")
-        t.update_section_description("Country", "France")
+        
+        # Sections de tableau (méthode unifiée)
+        t.set_section("Issuer", "Paul Berber", after_section="Listing")
+        t.set_section("New Section", "Description")  # Ajoute à la fin si pas de référence
+        t.set_section("Important", "Texte important", red_highlight_in_final=True)
+        t.set_section_order(["Issuer", "Country", "Currency"])
         t.remove_section("Old Section")
+        
+        # Paragraphes non structurés
+        t.add_content("Notice importante", red_highlight_in_final=True)
+        t.update_paragraph("Ancien texte", "Nouveau texte")
+        t.remove_paragraph("Paragraphe à supprimer")
+        
+        # Sections de Disclaimer (titre/contenu après tableaux)
+        t.set_disclaimer_section("Important note", "Nouveau texte\\nLigne 2")
+        t.update_disclaimer_content("Wichtiger Hinweis", "Contenu mis à jour")
+        t.add_disclaimer_content("Important Risks", "Paragraphe supplémentaire")
+        t.remove_disclaimer_section("Wesentliche Risiken")
+        
+        # Logo
         t.add_logo("logo.png")
+        
         t.execute_and_export("./output", "modifications.docx", "final.docx", "final.pdf")
     """
 
@@ -649,6 +1118,37 @@ class TermSheetTransformer:
         ))
         return self
 
+    def set_section(
+        self, 
+        title: str, 
+        description: str,
+        after_section: Optional[str] = None,
+        red_highlight_in_final: bool = False,
+        occurrence: int = 1
+    ) -> "TermSheetTransformer":
+        """
+        Ajoute ou met à jour une section dans le tableau.
+        - Si la section existe : met à jour la description
+        - Si la section n'existe pas : l'ajoute après after_section (ou à la fin si None)
+        - red_highlight_in_final : surligne en rouge dans la version finale (pas dans le markup)
+        """
+        self.operations.append(SetSectionOp(
+            title=title,
+            description=description,
+            after_section=after_section,
+            red_highlight_in_final=red_highlight_in_final,
+            occurrence=occurrence
+        ))
+        return self
+
+    def set_section_order(self, section_order: List[str]) -> "TermSheetTransformer":
+        """
+        Définit l'ordre des sections dans le tableau.
+        Les sections non listées sont placées à la fin.
+        """
+        self.operations.append(SetSectionOrderOp(section_order=section_order))
+        return self
+
     def remove_section(self, section_title: str, occurrence: int = 1) -> "TermSheetTransformer":
         self.operations.append(DeleteSectionOp(section_title=section_title, occurrence=occurrence))
         return self
@@ -678,6 +1178,95 @@ class TermSheetTransformer:
         """Modifie le contenu d'un paragraphe."""
         self.operations.append(UpdateParagraphOp(
             text_contains=text_contains, new_text=new_text, occurrence=occurrence
+        ))
+        return self
+
+    # -------------------------------------------------------------------------
+    # Gestion des sections de Disclaimer (paragraphes structurés après les tableaux)
+    # -------------------------------------------------------------------------
+
+    def set_disclaimer_section(
+        self,
+        title: str,
+        content: str,
+        after_title: Optional[str] = None,
+        red_highlight_in_final: bool = False,
+        occurrence: int = 1
+    ) -> "TermSheetTransformer":
+        """
+        Ajoute ou met à jour une section dans la partie Disclaimer (après les tableaux).
+        
+        - Si la section existe : remplace son contenu
+        - Si la section n'existe pas : l'ajoute après after_title (ou à la fin si None)
+        - Le content peut contenir des \\n pour séparer les paragraphes
+        - red_highlight_in_final : surligne en rouge dans la version finale
+        
+        Exemple:
+            t.set_disclaimer_section("Important note", "Texte ligne 1\\nTexte ligne 2")
+            t.set_disclaimer_section("New Warning", "Attention!", after_title="Important note")
+        """
+        self.operations.append(SetDisclaimerSectionOp(
+            title=title,
+            content=content,
+            after_title=after_title,
+            red_highlight_in_final=red_highlight_in_final,
+            occurrence=occurrence
+        ))
+        return self
+
+    def remove_disclaimer_section(self, title: str, occurrence: int = 1) -> "TermSheetTransformer":
+        """
+        Supprime une section de disclaimer complète (titre + contenu).
+        
+        Exemple:
+            t.remove_disclaimer_section("Important note")
+        """
+        self.operations.append(RemoveDisclaimerSectionOp(title=title, occurrence=occurrence))
+        return self
+
+    def update_disclaimer_content(
+        self,
+        title: str,
+        new_content: str,
+        red_highlight_in_final: bool = False,
+        occurrence: int = 1
+    ) -> "TermSheetTransformer":
+        """
+        Met à jour uniquement le contenu d'une section de disclaimer existante.
+        La section doit exister, sinon une erreur sera levée.
+        
+        Équivalent à set_disclaimer_section mais force que la section existe.
+        
+        Exemple:
+            t.update_disclaimer_content("Important note", "Nouveau contenu\\nDeuxième ligne")
+        """
+        self.operations.append(UpdateDisclaimerContentOp(
+            title=title,
+            new_content=new_content,
+            red_highlight_in_final=red_highlight_in_final,
+            occurrence=occurrence
+        ))
+        return self
+
+    def add_disclaimer_content(
+        self,
+        title: str,
+        additional_content: str,
+        red_highlight_in_final: bool = False,
+        occurrence: int = 1
+    ) -> "TermSheetTransformer":
+        """
+        Ajoute du contenu à la fin d'une section de disclaimer existante.
+        La section doit exister, sinon une erreur sera levée.
+        
+        Exemple:
+            t.add_disclaimer_content("Important note", "Paragraphe supplémentaire")
+        """
+        self.operations.append(AddDisclaimerContentOp(
+            title=title,
+            additional_content=additional_content,
+            red_highlight_in_final=red_highlight_in_final,
+            occurrence=occurrence
         ))
         return self
 
@@ -718,6 +1307,18 @@ class TermSheetTransformer:
                 editor_final.update_section_description(
                     op.section_title, op.new_description, op.occurrence
                 )
+            elif isinstance(op, SetSectionOp):
+                editor_markup.set_section(
+                    op.title, op.description, op.after_section, 
+                    red_highlight=False, occurrence=op.occurrence
+                )
+                editor_final.set_section(
+                    op.title, op.description, op.after_section,
+                    red_highlight=op.red_highlight_in_final, occurrence=op.occurrence
+                )
+            elif isinstance(op, SetSectionOrderOp):
+                editor_markup.set_section_order(op.section_order)
+                editor_final.set_section_order(op.section_order)
             elif isinstance(op, DeleteSectionOp):
                 editor_markup.delete_section(op.section_title, op.occurrence)
                 editor_final.delete_section(op.section_title, op.occurrence)
@@ -745,6 +1346,36 @@ class TermSheetTransformer:
             elif isinstance(op, UpdateParagraphOp):
                 editor_markup.update_paragraph(op.text_contains, op.new_text, op.occurrence)
                 editor_final.update_paragraph(op.text_contains, op.new_text, op.occurrence)
+            elif isinstance(op, SetDisclaimerSectionOp):
+                editor_markup.set_disclaimer_section(
+                    op.title, op.content, op.after_title,
+                    red_highlight=False, occurrence=op.occurrence
+                )
+                editor_final.set_disclaimer_section(
+                    op.title, op.content, op.after_title,
+                    red_highlight=op.red_highlight_in_final, occurrence=op.occurrence
+                )
+            elif isinstance(op, RemoveDisclaimerSectionOp):
+                editor_markup.remove_disclaimer_section(op.title, op.occurrence)
+                editor_final.remove_disclaimer_section(op.title, op.occurrence)
+            elif isinstance(op, UpdateDisclaimerContentOp):
+                editor_markup.update_disclaimer_content(
+                    op.title, op.new_content,
+                    red_highlight=False, occurrence=op.occurrence
+                )
+                editor_final.update_disclaimer_content(
+                    op.title, op.new_content,
+                    red_highlight=op.red_highlight_in_final, occurrence=op.occurrence
+                )
+            elif isinstance(op, AddDisclaimerContentOp):
+                editor_markup.add_disclaimer_content(
+                    op.title, op.additional_content,
+                    red_highlight=False, occurrence=op.occurrence
+                )
+                editor_final.add_disclaimer_content(
+                    op.title, op.additional_content,
+                    red_highlight=op.red_highlight_in_final, occurrence=op.occurrence
+                )
 
         path_markup = output_dir / markup_docx
         path_final = output_dir / final_docx
@@ -774,14 +1405,73 @@ if __name__ == "__main__":
     # Accepte .doc (conversion auto via LibreOffice) ou .docx
     transformer = TermSheetTransformer("mon_term_sheet.docx")
 
+    # Remplacements de mots
     transformer.replace_word("Mot1", "Mot2")
-    transformer.add_section_after("Listing", "Issuer", "Paul Berber")
+    
+    # Nouvelle méthode set_section : ajoute ou met à jour une section
+    # Si "Issuer" n'existe pas, l'ajoute après "Listing"
+    # Si "Issuer" existe, met à jour sa description
+    transformer.set_section("Issuer", "Paul Berber", after_section="Listing")
+    
+    # Si after_section n'est pas spécifié, ajoute à la fin du tableau
+    transformer.set_section("New Section", "Description de la nouvelle section")
+    
+    # Avec surlignage rouge dans la version finale
+    transformer.set_section("Important Note", "Texte important", red_highlight_in_final=True)
+    
+    # Pour des retours à la ligne dans la description, utiliser \n
+    transformer.set_section("Multi-line", "Ligne 1\nLigne 2\nLigne 3")
+    
+    # Anciennes méthodes toujours disponibles
+    transformer.add_section_after("Listing", "Other Section", "Other Description")
     transformer.update_section_description("Country", "France")
+    
+    # Définir l'ordre des sections
+    transformer.set_section_order(["Issuer", "Country", "Currency", "Amount"])
+    
+    # Suppression
     transformer.remove_section("Old Section")
+    
+    # Contenu hors tableau (paragraphes non structurés)
     transformer.add_content("Notice importante", red_highlight_in_final=True)
     transformer.add_content("Paragraphe après un autre", after_paragraph="Texte existant")
     transformer.update_paragraph("Ancien texte", "Nouveau texte")
     transformer.remove_paragraph("Paragraphe à supprimer")
+    
+    # -------------------------------------------------------------------------
+    # Sections de Disclaimer (paragraphes structurés titre/contenu après tableaux)
+    # -------------------------------------------------------------------------
+    
+    # Modifier une section de disclaimer existante
+    transformer.set_disclaimer_section(
+        "Important note",
+        "Nouveau texte pour cette section\nDeuxième paragraphe"
+    )
+    
+    # Ajouter une nouvelle section de disclaimer
+    transformer.set_disclaimer_section(
+        "New Warning",
+        "Ceci est un nouveau disclaimer\nAvec plusieurs lignes",
+        after_title="Important note",
+        red_highlight_in_final=True
+    )
+    
+    # Mettre à jour uniquement le contenu (la section doit exister)
+    transformer.update_disclaimer_content(
+        "Wichtiger Hinweis",
+        "Contenu mis à jour"
+    )
+    
+    # Ajouter du contenu à la fin d'une section existante
+    transformer.add_disclaimer_content(
+        "Important Risks",
+        "Paragraphe supplémentaire ajouté"
+    )
+    
+    # Supprimer une section de disclaimer complète
+    transformer.remove_disclaimer_section("Wesentliche Risiken")
+    
+    # Logo
     transformer.add_logo("logo_nbc.png", width_inches=0.8)
 
     transformer.execute_and_export(
