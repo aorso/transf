@@ -574,9 +574,9 @@ class _TermSheetEditor:
                         rpr.append(hl)
                     hl.set(qn("w:val"), highlight_color)
 
-        tr_list = list(tbl)
-        ref_idx = tr_list.index(ref_tr)
-        return table.rows[ref_idx + 1]
+        # Pas besoin de retourner la nouvelle ligne
+        # car elle est déjà ajoutée au tableau
+        return self
 
     def add_content(
         self,
@@ -599,7 +599,7 @@ class _TermSheetEditor:
                 if new_ppr is not None:
                     new_p._element.remove(new_ppr)
                 new_p._element.insert(0, deepcopy(target_ppr))
-            if target.runs:
+            if target.runs and new_p.runs:
                 self._copy_run_format(target.runs[-1], new_p.runs[0])
         else:
             # Créer un paragraphe temporaire pour trouver la position
@@ -879,10 +879,14 @@ class _TermSheetEditor:
                 insert_after = self._get_last_disclaimer_paragraph()
                 if insert_after is None:
                     # Pas de disclaimer existant, ajouter à la fin du document
-                    insert_after = list(self.doc.paragraphs)[-1] if self.doc.paragraphs else None
+                    all_paras = list(self.doc.paragraphs)
+                    if all_paras:
+                        insert_after = all_paras[-1]
+                    else:
+                        insert_after = None
             
             if insert_after is None:
-                raise ValueError("Impossible de trouver où insérer la section")
+                raise ValueError("Impossible de trouver où insérer la section - le document ne contient aucun paragraphe")
             
             # Créer le titre
             title_para = self.doc.add_paragraph()
@@ -1012,6 +1016,8 @@ class _TermSheetEditor:
     def add_logo_to_header(self, logo_path: str, width_inches: float = 1.0, all_sections: bool = True) -> bool:
         """Supprime le header existant et place uniquement le logo en haut à gauche."""
         try:
+            if not self.doc.sections:
+                raise ValueError("Le document ne contient aucune section")
             sections = self.doc.sections if all_sections else [self.doc.sections[0]]
             for section in sections:
                 header = section.header
