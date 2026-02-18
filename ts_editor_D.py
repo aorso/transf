@@ -401,7 +401,17 @@ class _TermSheetEditor:
                 ref_row, table = self._find_section_row(after_section, occurrence)
                 if ref_row is None:
                     raise ValueError(f"Section de référence introuvable : {after_section}")
-                self._create_minimal_row_after(table, ref_row, title, description, red_highlight)
+                # Utiliser une ligne de référence "standard" pour le style
+                # et insérer à l'endroit demandé (après ref_row).
+                format_row = self._find_reference_row_for_format(table) or ref_row
+                self._create_minimal_row_after(
+                    table,
+                    format_row,
+                    title,
+                    description,
+                    red_highlight,
+                    insert_after_row=ref_row,
+                )
             else:
                 # Ajouter à la fin du premier tableau
                 if not self.doc.tables:
@@ -511,15 +521,19 @@ class _TermSheetEditor:
         # Liste des titres à chercher dans l'ordre de priorité
         reference_titles = ["currency", "trade date"]
         
+        def norm(s: str) -> str:
+            return self._normalize(s).casefold()
+        
         for title_to_search in reference_titles:
             for row in table.rows:
-                if len(row.cells) >= 2:  # Vérifier qu'il y a bien 2 colonnes
-                    if self._normalize(row.cells[0].text) == title_to_search:
-                        return row
+                tcs = row._tr.findall(qn("w:tc"))
+                if len(tcs) >= 2 and norm(row.cells[0].text) == title_to_search:
+                    return row
         
-        # Fallback : chercher n'importe quelle ligne avec 2+ colonnes
+        # Fallback : chercher n'importe quelle ligne "simple" à 2 cellules réelles
         for row in table.rows:
-            if len(row.cells) >= 2:
+            tcs = row._tr.findall(qn("w:tc"))
+            if len(tcs) >= 2:
                 return row
         
         # Dernier fallback : la dernière ligne
@@ -572,10 +586,6 @@ class _TermSheetEditor:
             red_highlight: Surligner en rouge?
             insert_after_row: Ligne après laquelle insérer (si None, insère après ref_row)
         """
-        from docx.oxml.ns import nsmap
-        w_ns = nsmap['w']
-        
-        tbl = table._tbl
         ref_tr = ref_row._tr
         new_tr = deepcopy(ref_tr)
         
@@ -585,51 +595,38 @@ class _TermSheetEditor:
         else:
             ref_tr.addnext(new_tr)
 
-        texts = [new_title, new_description] if len(ref_row.cells) >= 2 else [f"{new_title}\n{new_description}"]
-        tcs = new_tr.findall(qn("w:tc"))
-        
-        # Vérification robuste pour éviter index out of range
-        for i, text in enumerate(texts):
-            if i >= len(tcs):  # Sortir si plus de cellules disponibles
+        # Récupérer l'objet Row python-docx correspondant à new_tr
+        new_row = None
+        for row in table.rows:
+            if row._tr is new_tr:
+                new_row = row
                 break
-            
-            tc = tcs[i]
-            t_elements = tc.findall(f".//{{{w_ns}}}t")
-            
-            # Vérifier que t_elements n'est pas vide
-            if t_elements and len(t_elements) > 0:
-                t_elements[0].text = text
-                for extra_t in t_elements[1:]:
-                    extra_t.text = ""
-            else:
-                # Si pas de t_elements, créer un run et un text element
-                # Trouver ou créer un paragraph dans la cellule
-                p_elem = tc.find(qn("w:p"))
-                if p_elem is not None:
-                    r_elem = OxmlElement("w:r")
-                    t_elem = OxmlElement("w:t")
-                    t_elem.text = text
-                    r_elem.append(t_elem)
-                    p_elem.append(r_elem)
-            
-            # Appliquer le surlignage approprié
-            highlight_color = None
-            if self.markup_mode:
-                highlight_color = "yellow"
-            elif red_highlight and i == 1:  # Surlignage rouge seulement sur la description (colonne 2)
-                highlight_color = "red"
-            
-            if highlight_color:
-                for r_elem in tc.findall(f".//{{{w_ns}}}r"):
-                    rpr = r_elem.find(qn("w:rPr"))
-                    if rpr is None:
-                        rpr = OxmlElement("w:rPr")
-                        r_elem.insert(0, rpr)
-                    hl = rpr.find(qn("w:highlight"))
-                    if hl is None:
-                        hl = OxmlElement("w:highlight")
-                        rpr.append(hl)
-                    hl.set(qn("w:val"), highlight_color)
+
+        if new_row is None:
+            return self
+
+        if len(new_row.cells) >= 2:
+            # Colonne titre
+            self._set_cell_text(
+                new_row.cells[0],
+                new_title,
+                highlight=self.markup_mode,
+                red_highlight=False
+            )
+            # Colonne description
+            self._set_cell_text(
+                new_row.cells[1],
+                new_description,
+                highlight=self.markup_mode,
+                red_highlight=red_highlight and not self.markup_mode
+            )
+        elif len(new_row.cells) == 1:
+            self._set_cell_text(
+                new_row.cells[0],
+                f"{new_title}: {new_description}",
+                highlight=self.markup_mode,
+                red_highlight=red_highlight and not self.markup_mode
+            )
 
         # Pas besoin de retourner la nouvelle ligne
         # car elle est déjà ajoutée au tableau
