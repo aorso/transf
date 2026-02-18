@@ -409,9 +409,13 @@ class _TermSheetEditor:
                 table = self.doc.tables[0]
                 if not table.rows:
                     raise ValueError("Le tableau est vide")
-                # Utiliser la dernière ligne comme référence
+                # Trouver une ligne de référence avec le bon format (Currency/Trade Date)
+                format_row = self._find_reference_row_for_format(table)
+                if format_row is None:
+                    raise ValueError("Impossible de trouver une ligne de référence valide dans le tableau")
+                # Insérer après la dernière ligne
                 last_row = table.rows[-1]
-                self._create_minimal_row_after(table, last_row, title, description, red_highlight)
+                self._create_minimal_row_after(table, format_row, title, description, red_highlight, insert_after_row=last_row)
         return self
 
     def set_section_order(self, section_order: List[str]):
@@ -499,6 +503,28 @@ class _TermSheetEditor:
     def _normalize(self, s: str) -> str:
         return " ".join((s or "").replace("\n", " ").split()).strip()
 
+    def _find_reference_row_for_format(self, table):
+        """
+        Trouve une ligne de référence avec le bon format (2 colonnes) pour cloner.
+        Priorité : "Currency" > "Trade Date" > n'importe quelle ligne avec 2+ colonnes > dernière ligne
+        """
+        # Liste des titres à chercher dans l'ordre de priorité
+        reference_titles = ["currency", "trade date"]
+        
+        for title_to_search in reference_titles:
+            for row in table.rows:
+                if len(row.cells) >= 2:  # Vérifier qu'il y a bien 2 colonnes
+                    if self._normalize(row.cells[0].text) == title_to_search:
+                        return row
+        
+        # Fallback : chercher n'importe quelle ligne avec 2+ colonnes
+        for row in table.rows:
+            if len(row.cells) >= 2:
+                return row
+        
+        # Dernier fallback : la dernière ligne
+        return table.rows[-1] if table.rows else None
+
     def _find_section_row(self, section_title: str, occurrence: int = 1):
         target = self._normalize(section_title)
         count = 0
@@ -534,15 +560,30 @@ class _TermSheetEditor:
                     count += self._count_occurrences_in_table(nested, target)
         return None
 
-    def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str, red_highlight: bool = False):
-        """Clone la ligne (format exact), modifie uniquement le texte (w:t) sans toucher pPr/rPr."""
+    def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str, red_highlight: bool = False, insert_after_row=None):
+        """
+        Clone la ligne (format exact), modifie uniquement le texte (w:t) sans toucher pPr/rPr.
+        
+        Args:
+            table: Le tableau
+            ref_row: Ligne de référence pour le FORMAT (sera clonée)
+            new_title: Titre de la nouvelle ligne
+            new_description: Description de la nouvelle ligne
+            red_highlight: Surligner en rouge?
+            insert_after_row: Ligne après laquelle insérer (si None, insère après ref_row)
+        """
         from docx.oxml.ns import nsmap
         w_ns = nsmap['w']
         
         tbl = table._tbl
         ref_tr = ref_row._tr
         new_tr = deepcopy(ref_tr)
-        ref_tr.addnext(new_tr)
+        
+        # Insérer après la ligne spécifiée ou après ref_row par défaut
+        if insert_after_row is not None:
+            insert_after_row._tr.addnext(new_tr)
+        else:
+            ref_tr.addnext(new_tr)
 
         texts = [new_title, new_description] if len(ref_row.cells) >= 2 else [f"{new_title}\n{new_description}"]
         tcs = new_tr.findall(qn("w:tc"))
@@ -884,6 +925,20 @@ class _TermSheetEditor:
                         run.font.highlight_color = WD_COLOR_INDEX.RED
         else:
             # Section n'existe pas : créer titre + contenu
+            # Trouver une section de disclaimer existante pour copier le style
+            ref_title_for_style = None
+            ref_content_for_style = None
+            
+            disclaimer_paras = self._get_disclaimer_paragraphs()
+            for para in disclaimer_paras:
+                if self._is_disclaimer_title(para) and ref_title_for_style is None:
+                    ref_title_for_style = para
+                elif not self._is_disclaimer_title(para) and para.text.strip() and ref_content_for_style is None:
+                    ref_content_for_style = para
+                if ref_title_for_style and ref_content_for_style:
+                    break
+            
+            # Déterminer où insérer
             if after_title:
                 ref_title_para, ref_content, last_content = self._find_disclaimer_section(after_title, 1)
                 if ref_title_para is None:
@@ -904,18 +959,32 @@ class _TermSheetEditor:
             if insert_after is None:
                 raise ValueError("Impossible de trouver où insérer la section - le document ne contient aucun paragraphe")
             
-            # Créer le titre
+            # Créer le titre avec le style d'un titre existant
             title_para = self.doc.add_paragraph()
             title_para._element.getparent().remove(title_para._element)
             insert_after._element.addnext(title_para._element)
             
-            # Mettre le titre en gras
+            # Copier le format de paragraphe (pPr) du titre de référence
+            if ref_title_for_style:
+                ref_ppr = ref_title_for_style._element.find(qn("w:pPr"))
+                if ref_ppr is not None:
+                    new_ppr = title_para._element.find(qn("w:pPr"))
+                    if new_ppr is not None:
+                        title_para._element.remove(new_ppr)
+                    title_para._element.insert(0, deepcopy(ref_ppr))
+            
+            # Ajouter le texte du titre et copier le format de run (rPr)
             title_run = title_para.add_run(title)
-            title_run.font.bold = True
+            if ref_title_for_style and ref_title_for_style.runs:
+                self._copy_run_format(ref_title_for_style.runs[0], title_run)
+            else:
+                # Fallback si pas de référence
+                title_run.font.bold = True
+            
             if self.markup_mode:
                 title_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
             
-            # Créer le contenu
+            # Créer le contenu avec le style d'un contenu existant
             content_lines = content.split('\n')
             last_elem = title_para._element
             for line in content_lines:
@@ -925,7 +994,20 @@ class _TermSheetEditor:
                     last_elem.addnext(new_p._element)
                     last_elem = new_p._element
                     
+                    # Copier le format de paragraphe (pPr) du contenu de référence
+                    if ref_content_for_style:
+                        ref_ppr = ref_content_for_style._element.find(qn("w:pPr"))
+                        if ref_ppr is not None:
+                            new_ppr = new_p._element.find(qn("w:pPr"))
+                            if new_ppr is not None:
+                                new_p._element.remove(new_ppr)
+                            new_p._element.insert(0, deepcopy(ref_ppr))
+                    
+                    # Ajouter le texte et copier le format de run (rPr)
                     run = new_p.add_run(line)
+                    if ref_content_for_style and ref_content_for_style.runs:
+                        self._copy_run_format(ref_content_for_style.runs[0], run)
+                    
                     # Highlighting
                     if self.markup_mode:
                         run.font.highlight_color = WD_COLOR_INDEX.YELLOW
