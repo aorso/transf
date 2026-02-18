@@ -480,6 +480,7 @@ class _TermSheetEditor:
         
         # Premier paragraphe avec la première ligne
         p = cell.paragraphs[0]
+        ref_run = None
         if p.runs:
             ref_run = p.runs[0]
             ref_run.text = lines[0] if lines else ""
@@ -500,17 +501,24 @@ class _TermSheetEditor:
                 r.font.highlight_color = WD_COLOR_INDEX.RED
             elif not self.markup_mode:
                 r.font.highlight_color = None
+            ref_run = r
         
         # Ajouter les lignes suivantes comme nouveaux paragraphes
         for line in lines[1:]:
-            new_p = cell.add_paragraph(line)
+            new_p = cell.add_paragraph("")
+            new_run = new_p.add_run(line)
+
+            # Copier le format du premier run pour préserver police/taille/etc.
+            if ref_run is not None:
+                self._copy_run_format(ref_run, new_run)
+
             if new_p.runs:
                 if highlight:
-                    new_p.runs[0].font.highlight_color = WD_COLOR_INDEX.YELLOW
+                    new_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
                 elif red_highlight:
-                    new_p.runs[0].font.highlight_color = WD_COLOR_INDEX.RED
+                    new_run.font.highlight_color = WD_COLOR_INDEX.RED
                 elif not self.markup_mode:
-                    new_p.runs[0].font.highlight_color = None
+                    new_run.font.highlight_color = None
 
     def _normalize(self, s: str) -> str:
         return " ".join((s or "").replace("\n", " ").split()).strip()
