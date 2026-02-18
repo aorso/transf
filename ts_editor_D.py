@@ -17,6 +17,8 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import re
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -513,6 +515,84 @@ class _TermSheetEditor:
     def _normalize(self, s: str) -> str:
         return " ".join((s or "").replace("\n", " ").split()).strip()
 
+    def _normalize_loose(self, s: str) -> str:
+        """
+        Normalisation souple pour la recherche de paragraphes :
+        - case-insensitive
+        - ignore ponctuation et multiples espaces
+        """
+        normalized = self._normalize(s).casefold()
+        umlaut_map = {
+            "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
+            "à": "a", "á": "a", "â": "a",
+            "è": "e", "é": "e", "ê": "e", "ë": "e",
+            "ì": "i", "í": "i", "î": "i", "ï": "i",
+            "ò": "o", "ó": "o", "ô": "o",
+            "ù": "u", "ú": "u", "û": "u",
+            "ç": "c",
+        }
+        normalized = "".join(umlaut_map.get(c, c) for c in normalized)
+        normalized = "".join(
+            c for c in unicodedata.normalize("NFKD", normalized)
+            if not unicodedata.combining(c)
+        )
+        normalized = re.sub(r"[^\w\s]", " ", normalized)
+        return " ".join(normalized.split()).strip()
+
+    def _contains_normalized(self, haystack: str, needle: str) -> bool:
+        """
+        Vérifie une inclusion textuelle robuste :
+        - exact brut
+        - brut case-insensitive
+        - inclusion après normalisation souple
+        """
+        if not needle:
+            return False
+        if needle in haystack:
+            return True
+        if needle.casefold() in haystack.casefold():
+            return True
+        normalized_needle = self._normalize_loose(needle)
+        normalized_haystack = self._normalize_loose(haystack)
+        if normalized_needle in normalized_haystack:
+            return True
+
+        # Variante plus permissive pour allemand translittéré (ae/oe/ue -> a/o/u).
+        plain_needle = normalized_needle.replace("ae", "a").replace("oe", "o").replace("ue", "u")
+        plain_haystack = normalized_haystack.replace("ae", "a").replace("oe", "o").replace("ue", "u")
+        return plain_needle in plain_haystack
+
+    def _paragraph_matches_query(self, paragraph, query: str) -> bool:
+        """Retourne True si le paragraphe correspond à la requête de façon tolérante."""
+        return self._contains_normalized(paragraph.text or "", query or "")
+
+    def _title_key(self, s: str) -> str:
+        """Clé de comparaison des titres de disclaimer (tolère ':' final et casse)."""
+        return self._normalize((s or "").rstrip(":")).casefold()
+
+    def _xml_onoff_true(self, elem, tag) -> bool:
+        """
+        Décode un booléen WordprocessingML (ex: w:b, w:i, w:u) en tenant compte de w:val.
+        """
+        if elem is None:
+            return False
+        node = elem.find(tag)
+        if node is None:
+            return False
+        val = node.get(qn("w:val"))
+        return val not in ("0", "false", "off")
+
+    def _run_is_effectively_bold(self, run, para_rpr) -> bool:
+        """
+        Détermine si un run est effectivement gras (run direct ou héritage paragraphe).
+        """
+        if run.bold is True:
+            return True
+        if run.bold is False:
+            return False
+        run_rpr = run._element.find(qn("w:rPr"))
+        return self._xml_onoff_true(run_rpr, qn("w:b")) or self._xml_onoff_true(para_rpr, qn("w:b"))
+
     def _find_reference_row_for_format(self, table):
         """
         Trouve une ligne de référence avec le bon format (2 colonnes) pour cloner.
@@ -778,10 +858,10 @@ class _TermSheetEditor:
         return self
 
     def _find_body_paragraph(self, text_contains: str, occurrence: int = 1):
-        """Trouve le n-ième paragraphe du body (hors tableaux) contenant le texte."""
+        """Trouve le n-ième paragraphe du body (hors tableaux) avec matching robuste."""
         count = 0
         for p in self.doc.paragraphs:
-            if text_contains in p.text:
+            if self._paragraph_matches_query(p, text_contains):
                 count += 1
                 if count == occurrence:
                     return p
@@ -794,19 +874,31 @@ class _TermSheetEditor:
     def _is_disclaimer_title(self, paragraph) -> bool:
         """
         Détecte si un paragraphe est un titre de disclaimer.
-        Critère : tous les runs en gras ET aucun souligné.
+        Critère robuste :
+        - texte non vide
+        - aucun run souligné
+        - tous les runs non vides effectivement en gras (directement ou par héritage)
         """
-        if not paragraph.text.strip():
+        text = self._normalize(paragraph.text)
+        if not text:
             return False
-        
+
         non_empty_runs = [r for r in paragraph.runs if r.text.strip()]
         if not non_empty_runs:
             return False
-        
-        all_bold = all(r.bold for r in non_empty_runs)
-        no_underline = not any(r.underline for r in non_empty_runs)
-        
-        return all_bold and no_underline
+
+        # Exclure les titres soulignés (ex: "Risk Terms") qui structurent autrement le document.
+        if any(r.underline for r in non_empty_runs):
+            return False
+
+        ppr = paragraph._element.find(qn("w:pPr"))
+        para_rpr = ppr.find(qn("w:rPr")) if ppr is not None else None
+        all_bold_effective = all(self._run_is_effectively_bold(r, para_rpr) for r in non_empty_runs)
+        if not all_bold_effective:
+            return False
+
+        # Garde-fou : un titre de section est en général court.
+        return len(text) <= 140
 
     def _get_last_table_index(self):
         """Retourne l'index du dernier tableau dans le body."""
@@ -835,11 +927,12 @@ class _TermSheetEditor:
         Retourne: (titre_paragraph, content_paragraphs[], last_content_paragraph)
         """
         disclaimer_paras = self._get_disclaimer_paragraphs()
-        target = self._normalize(title)
-        
+        target = self._title_key(title)
+
         count = 0
         for i, para in enumerate(disclaimer_paras):
-            if self._is_disclaimer_title(para) and self._normalize(para.text) == target:
+            # On privilégie le matching textuel du titre (plus robuste que le style seul).
+            if self._title_key(para.text) == target:
                 count += 1
                 if count == occurrence:
                     # Récupérer le contenu (paragraphes suivants jusqu'au prochain titre)
@@ -852,7 +945,7 @@ class _TermSheetEditor:
                             content.append(disclaimer_paras[j])
                             last_content = disclaimer_paras[j]
                     return para, content, last_content
-        
+
         return None, [], None
 
     def _get_last_disclaimer_paragraph(self):
@@ -942,6 +1035,10 @@ class _TermSheetEditor:
                     raise ValueError(f"Titre de référence introuvable : {after_title}")
                 # Insérer après le dernier paragraphe de contenu de la section de référence
                 insert_after = last_content if last_content else ref_title_para
+                # Pour le style, privilégier la section de référence explicitement visée.
+                ref_title_for_style = ref_title_para
+                if ref_content:
+                    ref_content_for_style = ref_content[0]
             else:
                 # Insérer à la fin
                 insert_after = self._get_last_disclaimer_paragraph()
