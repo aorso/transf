@@ -432,36 +432,49 @@ class _TermSheetEditor:
 
     def set_section_order(self, section_order: List[str]):
         """
-        Réorganise les lignes du tableau pour respecter l'ordre des sections spécifié.
-        Les sections non listées sont placées à la fin.
+        Réorganise les lignes du premier tableau selon l'ordre demandé.
+        Contraintes:
+        - La première ligne du tableau reste fixe quoi qu'il arrive.
+        - Les titres absents du document sont ignorés (aucune création).
+        - Les lignes non listées sont conservées à la fin (ordre relatif inchangé).
+        - Les lignes sont déplacées telles quelles (style/format inchangés).
         """
         if not self.doc.tables:
             return self
-        
+
         table = self.doc.tables[0]
-        rows_data = []
-        
-        # Récupérer toutes les lignes avec leur titre normalisé
-        for row in table.rows:
-            if len(row.cells) >= 1:
-                title = self._normalize(row.cells[0].text)
-                rows_data.append((title, row))
-        
-        # Trier selon l'ordre spécifié
-        def get_order_index(item):
-            title = item[0]
-            try:
-                return section_order.index(title)
-            except ValueError:
-                return len(section_order)  # Placer à la fin si non spécifié
-        
-        sorted_rows = sorted(rows_data, key=get_order_index)
-        
-        # Réorganiser les lignes dans le tableau
+        if not table.rows:
+            return self
+
+        fixed_first_row = table.rows[0]
+        movable_rows = list(table.rows[1:])
+        if not movable_rows:
+            return self
+
+        # Même normalisation que celle utilisée pour lire les titres du document.
+        order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
+        default_rank = len(order_map)
+
+        # Tri stable: d'abord ordre demandé, puis position d'origine.
+        ranked_rows = []
+        for original_pos, row in enumerate(movable_rows):
+            first_cell_text = row.cells[0].text if len(row.cells) >= 1 else ""
+            row_title = self._normalize(first_cell_text)
+            rank = order_map.get(row_title, default_rank)
+            ranked_rows.append((rank, original_pos, row))
+
+        ranked_rows.sort(key=lambda x: (x[0], x[1]))
+
+        # Déplacement XML des mêmes <w:tr> => style et structure conservés.
         tbl = table._tbl
-        for title, row in sorted_rows:
-            tbl.append(row._tr)
-        
+        for row in movable_rows:
+            tbl.remove(row._tr)
+
+        cursor_tr = fixed_first_row._tr
+        for _, _, row in ranked_rows:
+            cursor_tr.addnext(row._tr)
+            cursor_tr = row._tr
+
         return self
 
     def _set_cell_text(self, cell, text: str, highlight: bool = False, red_highlight: bool = False):
