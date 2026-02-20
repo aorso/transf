@@ -331,7 +331,7 @@ class _TermSheetEditor:
     def update_section_description(self, section_title: str, new_description: str, occurrence: int = 1):
         row, table = self._find_section_row(section_title, occurrence)
         if row is None:
-            raise ValueError(f"Section introuvable : {section_title}")
+            return self
         if len(row.cells) >= 2:
             self._set_cell_text(row.cells[1], new_description, highlight=self.markup_mode)
         elif len(row.cells) == 1:
@@ -342,7 +342,7 @@ class _TermSheetEditor:
     def delete_section(self, section_title: str, occurrence: int = 1):
         row, table = self._find_section_row(section_title, occurrence)
         if row is None:
-            raise ValueError(f"Section introuvable : {section_title}")
+            return self
         if self.markup_mode:
             self._strike_row(row)
         else:
@@ -603,16 +603,47 @@ class _TermSheetEditor:
         val = node.get(qn("w:val"))
         return val not in ("0", "false", "off")
 
-    def _run_is_effectively_bold(self, run, para_rpr) -> bool:
+    def _style_chain_bold(self, style):
         """
-        Détermine si un run est effectivement gras (run direct ou héritage paragraphe).
+        Retourne True/False si le gras est explicitement défini dans la chaîne
+        de styles (style -> base_style), sinon None.
+        """
+        current = style
+        while current is not None:
+            try:
+                bold = current.font.bold
+            except AttributeError:
+                bold = None
+            if bold is not None:
+                return bool(bold)
+            current = getattr(current, "base_style", None)
+        return None
+
+    def _run_is_effectively_bold(self, run, para_rpr, para_style=None) -> bool:
+        """
+        Détermine si un run est effectivement gras:
+        - propriété directe du run
+        - XML run/paragraphe
+        - héritage des styles (run style / paragraphe style)
         """
         if run.bold is True:
             return True
         if run.bold is False:
             return False
+
         run_rpr = run._element.find(qn("w:rPr"))
-        return self._xml_onoff_true(run_rpr, qn("w:b")) or self._xml_onoff_true(para_rpr, qn("w:b"))
+        if self._xml_onoff_true(run_rpr, qn("w:b")) or self._xml_onoff_true(para_rpr, qn("w:b")):
+            return True
+
+        run_style_bold = self._style_chain_bold(getattr(run, "style", None))
+        if run_style_bold is not None:
+            return run_style_bold
+
+        para_style_bold = self._style_chain_bold(para_style)
+        if para_style_bold is not None:
+            return para_style_bold
+
+        return False
 
     def _find_reference_row_for_format(self, table):
         """
@@ -857,7 +888,7 @@ class _TermSheetEditor:
         Mode mark-up : barre le texte au lieu de le supprimer."""
         target = self._find_body_paragraph(text_contains, occurrence)
         if target is None:
-            raise ValueError(f"Paragraphe introuvable contenant : {text_contains!r}")
+            return self
         if self.markup_mode:
             for run in target.runs:
                 run.font.strike = True
@@ -871,7 +902,7 @@ class _TermSheetEditor:
         Mode mark-up : surligne le nouveau texte en jaune."""
         target = self._find_body_paragraph(text_contains, occurrence)
         if target is None:
-            raise ValueError(f"Paragraphe introuvable contenant : {text_contains!r}")
+            return self
         target.clear()
         run = target.add_run(new_text)
         if self.markup_mode:
@@ -898,7 +929,7 @@ class _TermSheetEditor:
         Critère robuste :
         - texte non vide
         - aucun run souligné
-        - tous les runs non vides effectivement en gras (directement ou par héritage)
+        - majoritairement gras (incluant le gras hérité des styles Word)
         """
         text = self._normalize(paragraph.text)
         if not text:
@@ -914,8 +945,23 @@ class _TermSheetEditor:
 
         ppr = paragraph._element.find(qn("w:pPr"))
         para_rpr = ppr.find(qn("w:rPr")) if ppr is not None else None
-        all_bold_effective = all(self._run_is_effectively_bold(r, para_rpr) for r in non_empty_runs)
-        if not all_bold_effective:
+        para_style = getattr(paragraph, "style", None)
+
+        total_chars = 0
+        bold_chars = 0
+        for run in non_empty_runs:
+            run_text = run.text or ""
+            char_count = len(run_text)
+            total_chars += char_count
+            if self._run_is_effectively_bold(run, para_rpr, para_style=para_style):
+                bold_chars += char_count
+
+        if total_chars == 0:
+            return False
+
+        # Tolérance utile quand Word segmente le texte en runs hétérogènes.
+        bold_ratio = bold_chars / total_chars
+        if bold_ratio < 0.8:
             return False
 
         # Garde-fou : un titre de section est en général court.
@@ -1138,7 +1184,7 @@ class _TermSheetEditor:
         """
         title_para, content_paras, _ = self._find_disclaimer_section(title, occurrence)
         if title_para is None:
-            raise ValueError(f"Section de disclaimer introuvable : {title}")
+            return self
         
         if self.markup_mode:
             # Barrer le titre
@@ -1172,7 +1218,7 @@ class _TermSheetEditor:
         """
         title_para, content_paras, _ = self._find_disclaimer_section(title, occurrence)
         if title_para is None:
-            raise ValueError(f"Section de disclaimer introuvable : {title}")
+            return self
         
         # Utiliser set_disclaimer_section qui gère déjà la mise à jour
         return self.set_disclaimer_section(title, new_content, red_highlight=red_highlight, occurrence=occurrence)
@@ -1189,7 +1235,7 @@ class _TermSheetEditor:
         """
         title_para, content_paras, last_content = self._find_disclaimer_section(title, occurrence)
         if title_para is None:
-            raise ValueError(f"Section de disclaimer introuvable : {title}")
+            return self
         
         # Trouver où insérer
         insert_after = last_content if last_content else title_para
