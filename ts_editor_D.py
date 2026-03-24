@@ -357,6 +357,24 @@ class _TermSheetEditor:
                     r.font.strike = True
                     r.font.highlight_color = WD_COLOR_INDEX.YELLOW
 
+    def get_section_description(self, section_title: str, occurrence: int = 1) -> Optional[str]:
+        """
+        Lit la description d'une section et la retourne sous forme de string.
+        - Retourne None si la section est introuvable.
+        - Pour les lignes à 2 colonnes : retourne le texte de la deuxième cellule.
+        - Pour les lignes à 1 colonne (format "Titre: description") : retourne la partie après le premier ':'.
+        """
+        row, _ = self._find_section_row(section_title, occurrence)
+        if row is None:
+            return None
+        if len(row.cells) >= 2:
+            return row.cells[1].text
+        if len(row.cells) == 1:
+            text = row.cells[0].text
+            if ":" in text:
+                return text.split(":", 1)[1].strip()
+        return None
+
     def insert_section_after(self, after_section: str, new_title: str, new_description: str, occurrence: int = 1):
         ref_row, table = self._find_section_row(after_section, occurrence)
         if ref_row is None:
@@ -1364,6 +1382,22 @@ class TermSheetTransformer:
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
             except Exception:
                 pass
+
+    def get_section_description(self, section_title: str, occurrence: int = 1) -> Optional[str]:
+        """
+        Lit la description d'une section directement dans le document source et la retourne.
+
+        Retourne None si la section est introuvable.
+
+        Exemple :
+            issuer = transformer.get_section_description("Issuer")
+            # issuer == "BNP"
+            transformer.set_section("Issuer", issuer + " bank")
+            # => "BNP bank"
+        """
+        doc = Document(str(self.docx_path))
+        editor = _TermSheetEditor(doc, markup_mode=False)
+        return editor.get_section_description(section_title, occurrence)
 
     def replace_word(self, old: str, new: str, occurrence: int = 1) -> "TermSheetTransformer":
         self.operations.append(ReplaceOp(old=old, new=new, occurrence=occurrence))
