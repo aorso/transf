@@ -31,7 +31,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches
 
 
-# -----------------------------------------------------------------------------
+# ---op--------------------------------------------------------------------------
 # Conversion .doc → .docx
 # -----------------------------------------------------------------------------
 
@@ -433,10 +433,10 @@ class _TermSheetEditor:
                     insert_after_row=ref_row,
                 )
             else:
-                # Ajouter à la fin du premier tableau
+                # Ajouter à la fin du tableau principal
                 if not self.doc.tables:
                     raise ValueError("Aucun tableau trouvé dans le document")
-                table = self.doc.tables[0]
+                table = self._find_main_table()
                 if not table.rows:
                     raise ValueError("Le tableau est vide")
                 # Trouver une ligne de référence avec le bon format (Currency/Trade Date)
@@ -448,9 +448,24 @@ class _TermSheetEditor:
                 self._create_minimal_row_after(table, format_row, title, description, red_highlight, insert_after_row=last_row)
         return self
 
+    def _find_main_table(self):
+        """
+        Retourne le tableau principal du document :
+        le tableau à 2+ colonnes ayant le plus grand nombre de lignes.
+        Repli sur doc.tables[0] si aucun tableau à 2 colonnes n'est trouvé.
+        """
+        best = None
+        best_rows = -1
+        for table in self.doc.tables:
+            has_two_cols = any(len(row.cells) >= 2 for row in table.rows)
+            if has_two_cols and len(table.rows) > best_rows:
+                best = table
+                best_rows = len(table.rows)
+        return best if best is not None else (self.doc.tables[0] if self.doc.tables else None)
+
     def set_section_order(self, section_order: List[str]):
         """
-        Réorganise les lignes du premier tableau selon l'ordre demandé.
+        Réorganise les lignes du tableau principal selon l'ordre demandé.
         Contraintes:
         - La première ligne du tableau reste fixe quoi qu'il arrive.
         - Les titres absents du document sont ignorés (aucune création).
@@ -460,7 +475,7 @@ class _TermSheetEditor:
         if not self.doc.tables:
             return self
 
-        table = self.doc.tables[0]
+        table = self._find_main_table()
         if not table.rows:
             return self
 
