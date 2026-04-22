@@ -6,7 +6,7 @@ Glisser-déposer le fichier TXT → télécharger le fichier Excel formaté.
 
 import csv
 import io
-import re
+import datetime
 import pandas as pd
 import streamlit as st
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 
 # ─── STYLES EXCEL ────────────────────────────────────────────────────────────
 
-_GREEN_FILL   = PatternFill(start_color="375623", end_color="375623", fill_type="solid")
+_GREEN_FILL   = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
 _WHITE_BOLD   = Font(bold=True, color="FFFFFF")
 _THIN_BLACK   = Side(style="thin", color="000000")
 _BLACK_BORDER = Border(
@@ -52,20 +52,6 @@ def load_302_303(file_bytes: bytes) -> pd.DataFrame:
     return pd.DataFrame(data, columns=header)
 
 
-def extract_date_yyyymmdd(filename: str) -> str:
-    """
-    Extrait DDMMYYYY en fin de nom de fichier → retourne YYYYMMDD.
-    Ex. : "FULL POSITIONS REPORT_Confidential 22042026.TXT" → "20260422"
-    """
-    stem = filename.rsplit(".", 1)[0]
-    match = re.search(r'(\d{2})(\d{2})(\d{4})\s*$', stem)
-    if not match:
-        raise ValueError(
-            f"Impossible d'extraire une date DDMMYYYY depuis le nom : '{stem}'"
-        )
-    dd, mm, yyyy = match.groups()
-    return f"{yyyy}{mm}{dd}"
-
 
 def format_sheet(ws, df: pd.DataFrame, pct_cols: list | None = None):
     """Formate une feuille openpyxl : en-tête vert, bordures noires, colonnes ajustées."""
@@ -97,7 +83,7 @@ def format_sheet(ws, df: pd.DataFrame, pct_cols: list | None = None):
     ws.sheet_view.showGridLines = False
 
 
-def build_excel(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+def build_excel(file_bytes: bytes) -> tuple[bytes, str]:
     """
     Exécute tout le pipeline et retourne (excel_bytes, output_filename).
     """
@@ -123,19 +109,19 @@ def build_excel(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
     tab2.rename(columns={"Weight": "% Diversification"}, inplace=True)
     tab2.insert(0, "Rank", range(1, len(tab2) + 1))
 
-    # Nom du fichier de sortie
-    date_str      = extract_date_yyyymmdd(filename)
-    output_name   = f"{date_str} - Collatéral Pool.xlsx"
+    # Nom du fichier de sortie : date du jour au format YYYYMMDD
+    date_str    = datetime.date.today().strftime("%Y%m%d")
+    output_name = f"{date_str} - Collateral Pool.xlsx"
 
     # Génération Excel en mémoire
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         tab0.to_excel(writer, sheet_name="ALL",               index=False)
-        tab1.to_excel(writer, sheet_name="Table",             index=False)
+        tab1.to_excel(writer, sheet_name="Top20",            index=False)
         tab2.to_excel(writer, sheet_name="% Diversification", index=False)
 
         format_sheet(writer.sheets["ALL"],               tab0)
-        format_sheet(writer.sheets["Table"],             tab1)
+        format_sheet(writer.sheets["Top20"],             tab1)
         format_sheet(
             writer.sheets["% Diversification"],
             tab2,
@@ -162,7 +148,7 @@ st.markdown(
 uploaded = st.file_uploader(
     label="Glisser-déposer ou sélectionner le fichier TXT",
     type=["txt", "TXT"],
-    help="Le nom du fichier doit se terminer par une date au format DDMMYYYY",
+    help="Fichier FULL POSITIONS REPORT au format TXT",
 )
 
 if uploaded is not None:
@@ -170,7 +156,7 @@ if uploaded is not None:
 
     with st.spinner("Traitement en cours…"):
         try:
-            excel_bytes, output_name = build_excel(uploaded.read(), uploaded.name)
+            excel_bytes, output_name = build_excel(uploaded.read())
 
             st.success(f"Fichier prêt : **{output_name}**")
 
@@ -185,7 +171,7 @@ if uploaded is not None:
                 total = df_preview["Marginal Value"].sum()
                 df_preview["Weight"] = df_preview["Marginal Value"] / total
 
-                tab_all, tab_top20, tab_pct = st.tabs(["ALL", "Table (Top 20)", "% Diversification"])
+                tab_all, tab_top20, tab_pct = st.tabs(["ALL", "Top20", "% Diversification"])
                 with tab_all:
                     st.dataframe(
                         df_preview[["Security Name", "ISIN Code"]].rename(columns={"ISIN Code": "ISIN"}),
