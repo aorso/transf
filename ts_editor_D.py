@@ -329,29 +329,54 @@ class _TermSheetEditor:
             dst_run.font.highlight_color = None
 
     def update_section_description(self, section_title: str, new_description: str, occurrence: int = 1):
-        row, table = self._find_section_row(section_title, occurrence)
-        if row is None:
+        main_row, continuation_rows, _ = self._find_section_row_group(section_title, occurrence)
+        if main_row is None:
             return self
-        if len(row.cells) >= 2:
-            self._set_cell_text(row.cells[1], new_description, highlight=self.markup_mode)
-            # Lignes de continuation : on vide/barre leur cellule description (B2, B3, ...)
-            # car la nouvelle description est entièrement portée par B1.
-            for cont_row in self._find_continuation_rows(table, row):
-                if len(cont_row.cells) >= 2:
-                    self._clear_continuation_description_cell(cont_row.cells[1])
-        elif len(row.cells) == 1:
-            title = self._normalize(row.cells[0].text)
-            self._set_cell_text(row.cells[0], f"{title}: {new_description}", highlight=self.markup_mode)
+        if len(main_row.cells) >= 2:
+            self._set_cell_text(main_row.cells[1], new_description, highlight=self.markup_mode)
+            for row in continuation_rows:
+                if len(row.cells) >= 2:
+                    self._set_cell_text(row.cells[1], "", highlight=False)
+        elif len(main_row.cells) == 1:
+            title = self._normalize(main_row.cells[0].text)
+            self._set_cell_text(main_row.cells[0], f"{title}: {new_description}", highlight=self.markup_mode)
         return self
 
     def delete_section(self, section_title: str, occurrence: int = 1):
-        row, table = self._find_section_row(section_title, occurrence)
-        if row is None:
+        main_row, continuation_rows, table = self._find_section_row_group(section_title, occurrence)
+        if main_row is None:
             return self
+        all_rows = [main_row] + continuation_rows
+
+        # Détecter un éventuel tableau externe associé (si la dernière ligne du groupe
+        # est aussi la dernière ligne du tableau 2-col parent)
+        ext_group = self._find_external_group_for_last_row(table, all_rows[-1])
+
         if self.markup_mode:
-            self._strike_row(row)
+            for row in all_rows:
+                self._strike_row(row)
+            # En mode markup on barre aussi le contenu du tableau externe
+            if ext_group:
+                for elem in ext_group:
+                    if elem.tag.split('}')[-1] == 'tbl':
+                        for tr in elem.findall('.//' + qn('w:tr')):
+                            for tc in tr.findall(qn('w:tc')):
+                                for p in tc.findall('.//' + qn('w:p')):
+                                    for r in p.findall(qn('w:r')):
+                                        rpr = r.find(qn('w:rPr'))
+                                        if rpr is None:
+                                            rpr = OxmlElement('w:rPr')
+                                            r.insert(0, rpr)
+                                        strike = OxmlElement('w:strike')
+                                        rpr.append(strike)
         else:
-            table._tbl.remove(row._tr)
+            for row in all_rows:
+                table._tbl.remove(row._tr)
+            if ext_group:
+                body = self.doc.element.body
+                for elem in ext_group:
+                    if elem.getparent() is body:
+                        body.remove(elem)
         return self
 
     def _strike_row(self, row):
@@ -365,26 +390,26 @@ class _TermSheetEditor:
     def get_section_description(self, section_title: str, occurrence: int = 1) -> Optional[str]:
         """
         Lit la description d'une section et la retourne sous forme de string.
-        - Retourne None si la section est introuvable.
-        - Pour les lignes à 2 colonnes : retourne le texte de la deuxième cellule,
-          concaténé avec les cellules description des éventuelles lignes de
-          continuation (titre vide), jointes par '\\n'.
-        - Pour les lignes à 1 colonne (format "Titre: description") : retourne la
-          partie après le premier ':'.
+
+        Gère les cellules non fusionnées : si des lignes à titre vide suivent
+        la ligne principale (A2/A3 vides, B2/B3 avec contenu), leurs descriptions
+        sont assemblées en un seul texte séparé par des sauts de ligne.
+
+        Retourne None si la section est introuvable.
         """
-        row, table = self._find_section_row(section_title, occurrence)
-        if row is None:
+        main_row, continuation_rows, _ = self._find_section_row_group(section_title, occurrence)
+        if main_row is None:
             return None
-        if len(row.cells) >= 2:
-            parts = [row.cells[1].text]
-            for cont_row in self._find_continuation_rows(table, row):
-                if len(cont_row.cells) >= 2:
-                    parts.append(cont_row.cells[1].text)
-            # Filtrer les fragments vides (cellules de description vides)
-            parts = [p for p in parts if (p or "").strip()]
-            return "\n".join(parts) if parts else ""
-        if len(row.cells) == 1:
-            text = row.cells[0].text
+        if len(main_row.cells) >= 2:
+            parts = []
+            for row in [main_row] + continuation_rows:
+                if len(row.cells) >= 2:
+                    text = row.cells[1].text
+                    if text.strip():
+                        parts.append(text)
+            return "\n".join(parts)
+        if len(main_row.cells) == 1:
+            text = main_row.cells[0].text
             if ":" in text:
                 return text.split(":", 1)[1].strip()
         return None
@@ -409,29 +434,24 @@ class _TermSheetEditor:
         - Si la section existe : met à jour la description
         - Si la section n'existe pas : l'ajoute après after_section (ou à la fin si None)
         """
-        row, table = self._find_section_row(title, occurrence)
-        
-        if row is not None:
+        main_row, continuation_rows, table = self._find_section_row_group(title, occurrence)
+
+        if main_row is not None:
             # Section existe : mise à jour de la description
-            if len(row.cells) >= 2:
+            if len(main_row.cells) >= 2:
                 self._set_cell_text(
-                    row.cells[1], 
+                    main_row.cells[1], 
                     description, 
                     highlight=self.markup_mode,
                     red_highlight=red_highlight and not self.markup_mode
                 )
-                # Lignes de continuation : la nouvelle description est portée
-                # entièrement par B1, on vide/barre les cellules description suivantes.
-                for cont_row in self._find_continuation_rows(table, row):
+                for cont_row in continuation_rows:
                     if len(cont_row.cells) >= 2:
-                        self._clear_continuation_description_cell(
-                            cont_row.cells[1],
-                            red_highlight=red_highlight and not self.markup_mode,
-                        )
-            elif len(row.cells) == 1:
-                norm_title = self._normalize(row.cells[0].text)
+                        self._set_cell_text(cont_row.cells[1], "", highlight=False)
+            elif len(main_row.cells) == 1:
+                norm_title = self._normalize(main_row.cells[0].text)
                 self._set_cell_text(
-                    row.cells[0], 
+                    main_row.cells[0], 
                     f"{norm_title}: {description}",
                     highlight=self.markup_mode,
                     red_highlight=red_highlight and not self.markup_mode
@@ -472,53 +492,12 @@ class _TermSheetEditor:
 
     def _find_main_table(self):
         """
-        Retourne le tableau principal du document : le plus grand tableau
-        ayant l'allure d'un tableau "titre / description" (2 colonnes).
-
-        Heuristique :
-        - On ne considère que les tableaux dont la majorité des lignes
-          ont exactement 2 cellules <w:tc> directes (cellules "réelles",
-          insensibles aux fusions verticales) et au plus 3 cellules max.
-        - Cela exclut les tableaux larges (ex : grille de 6 colonnes
-          d'underlying shares) qui peuvent se trouver "collés" entre
-          deux tableaux titre/description et que python-docx remonte
-          dans `doc.tables` au même niveau.
-        - Parmi les tableaux candidats, on retient celui ayant le plus
-          grand nombre de lignes.
-        - Repli : si aucun tableau ne passe l'heuristique, on retombe
-          sur l'ancienne logique (tableau ≥ 2 colonnes le plus long),
-          puis sur `doc.tables[0]`.
+        Retourne le tableau principal du document :
+        le tableau à 2+ colonnes ayant le plus grand nombre de lignes.
+        Repli sur doc.tables[0] si aucun tableau à 2 colonnes n'est trouvé.
         """
-        def real_col_counts(table) -> List[int]:
-            counts = []
-            for row in table.rows:
-                tcs = row._tr.findall(qn("w:tc"))
-                counts.append(len(tcs))
-            return counts
-
-        def looks_like_title_description(table) -> bool:
-            counts = real_col_counts(table)
-            if not counts:
-                return False
-            if max(counts) > 3:
-                return False
-            # Majorité de lignes à exactement 2 cellules réelles
-            two_col_rows = sum(1 for c in counts if c == 2)
-            return two_col_rows * 2 >= len(counts)
-
         best = None
         best_rows = -1
-        for table in self.doc.tables:
-            if not looks_like_title_description(table):
-                continue
-            if len(table.rows) > best_rows:
-                best = table
-                best_rows = len(table.rows)
-
-        if best is not None:
-            return best
-
-        # Fallback : ancienne logique (tableau ≥ 2 col le plus long)
         for table in self.doc.tables:
             has_two_cols = any(len(row.cells) >= 2 for row in table.rows)
             if has_two_cols and len(table.rows) > best_rows:
@@ -528,69 +507,117 @@ class _TermSheetEditor:
 
     def set_section_order(self, section_order: List[str]):
         """
-        Réorganise les lignes du tableau principal selon l'ordre demandé.
-        Contraintes:
-        - La première ligne du tableau reste fixe quoi qu'il arrive.
+        Réorganise les sections selon l'ordre demandé.
+
+        Gère les sections avec tableaux de description externe (standalone dans le body) :
+        le tableau externe suit toujours sa section, même après réordonnancement.
+
+        Contraintes :
+        - La première ligne du premier tableau 2-col reste fixe.
         - Les titres absents du document sont ignorés (aucune création).
         - Les lignes non listées sont conservées à la fin (ordre relatif inchangé).
-        - Les lignes sont déplacées telles quelles (style/format inchangés).
         """
         if not self.doc.tables:
             return self
 
-        table = self._find_main_table()
-        if not table.rows:
+        body = self.doc.element.body
+
+        # --- 1. Collecter tous les tableaux 2-col et leurs éléments externes ---
+        two_col_data = self._get_body_two_col_tables()
+
+        # Fallback : comportement original si aucun tableau 2-col trouvé au niveau body
+        if not two_col_data:
+            table = self._find_main_table()
+            if not table or not table.rows:
+                return self
+            return self._sort_rows_in_table(table, section_order)
+
+        first_tbl_obj = two_col_data[0][0]
+        if not first_tbl_obj.rows:
+            return self
+        fixed_first_row = first_tbl_obj.rows[0]
+
+        # --- 2. Collecter toutes les lignes mobiles (tous tableaux 2-col confondus) ---
+        all_rows = []
+        row_to_ext_group = {}  # id(row._tr) → ext_group (pour la dernière ligne de chaque tbl)
+
+        for i, (tbl_obj, ext_group) in enumerate(two_col_data):
+            start = 1 if i == 0 else 0
+            rows = list(tbl_obj.rows)[start:]
+            all_rows.extend(rows)
+            if ext_group and tbl_obj.rows:
+                row_to_ext_group[id(tbl_obj.rows[-1]._tr)] = ext_group
+
+        if not all_rows:
             return self
 
-        fixed_first_row = table.rows[0]
-        movable_rows = list(table.rows[1:])
-        if not movable_rows:
-            return self
-
-        # Même normalisation que celle utilisée pour lire les titres du document.
+        # --- 3. Trier ---
         order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
         default_rank = len(order_map)
 
-        # Tri stable: d'abord ordre demandé, puis position d'origine.
+        ranked = []
+        for orig_pos, row in enumerate(all_rows):
+            title_text = row.cells[0].text if row.cells else ""
+            rank = order_map.get(self._normalize(title_text), default_rank)
+            ranked.append((rank, orig_pos, row))
+
+        ranked.sort(key=lambda x: (x[0], x[1]))
+        sorted_rows = [row for _, _, row in ranked]
+
+        # --- 4. Retirer du body tous les ext_groups et les tableaux 2-col non-premiers ---
+        for i, (tbl_obj, ext_group) in enumerate(two_col_data):
+            if i > 0:
+                body.remove(tbl_obj._tbl)
+            for elem in ext_group:
+                if elem.getparent() is body:
+                    body.remove(elem)
+
+        # --- 5. Fusionner toutes les lignes dans le premier tableau ---
+        first_tbl = first_tbl_obj._tbl
+        for row in list(first_tbl_obj.rows)[1:]:
+            first_tbl.remove(row._tr)
+
+        cursor_tr = fixed_first_row._tr
+        for row in sorted_rows:
+            cursor_tr.addnext(row._tr)
+            cursor_tr = row._tr
+
+        # --- 6. Re-couper le tableau fusionné aux frontières des tableaux externes ---
+        # Traité de la dernière à la première pour ne pas perturber les indices
+        ext_rows = [
+            (idx, row, row_to_ext_group[id(row._tr)])
+            for idx, row in enumerate(sorted_rows)
+            if id(row._tr) in row_to_ext_group
+        ]
+
+        for _idx, row, ext_group in reversed(ext_rows):
+            # La ligne peut désormais être dans first_tbl ou dans un tableau de continuation
+            self._split_table_after_row(row._tr, ext_group)
+
+        return self
+
+    def _sort_rows_in_table(self, table, section_order: List[str]):
+        """Tri simple des lignes au sein d'un unique tableau (comportement original)."""
+        if not table.rows:
+            return self
+        fixed_first_row = table.rows[0]
+        movable_rows = list(table.rows[1:])
+        order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
+        default_rank = len(order_map)
         ranked_rows = []
         for original_pos, row in enumerate(movable_rows):
             first_cell_text = row.cells[0].text if len(row.cells) >= 1 else ""
-            row_title = self._normalize(first_cell_text)
-            rank = order_map.get(row_title, default_rank)
+            rank = order_map.get(self._normalize(first_cell_text), default_rank)
             ranked_rows.append((rank, original_pos, row))
-
         ranked_rows.sort(key=lambda x: (x[0], x[1]))
-
-        # Déplacement XML des mêmes <w:tr> => style et structure conservés.
         tbl = table._tbl
         for row in movable_rows:
             tbl.remove(row._tr)
-
         cursor_tr = fixed_first_row._tr
         for _, _, row in ranked_rows:
             cursor_tr.addnext(row._tr)
             cursor_tr = row._tr
-
         return self
-
-    def _clear_continuation_description_cell(self, cell, red_highlight: bool = False):
-        """
-        Vide la cellule de description d'une ligne de continuation.
-        - En markup_mode : barre le texte existant et le surligne en jaune
-          (la cellule garde son contenu mais signale visuellement la suppression).
-        - En mode final : vide complètement la cellule. Si red_highlight=True,
-          un run vide surligné en rouge est posé pour cohérence avec les autres
-          opérations finales.
-        """
-        if self.markup_mode:
-            for p in cell.paragraphs:
-                for r in p.runs:
-                    if (r.text or "").strip() == "":
-                        continue
-                    r.font.strike = True
-                    r.font.highlight_color = WD_COLOR_INDEX.YELLOW
-        else:
-            self._set_cell_text(cell, "", highlight=False, red_highlight=red_highlight)
 
     def _set_cell_text(self, cell, text: str, highlight: bool = False, red_highlight: bool = False):
         """
@@ -763,12 +790,7 @@ class _TermSheetEditor:
     def _find_reference_row_for_format(self, table):
         """
         Trouve une ligne de référence avec le bon format (2 colonnes) pour cloner.
-        Priorité : "Currency" > "Trade Date" > n'importe quelle ligne avec 2-3
-        cellules réelles (≤ 3 pour tolérer une éventuelle 3ᵉ colonne d'unités/notes).
-        On exclut les lignes à plus de 3 cellules afin d'éviter de cloner une
-        ligne issue d'un tableau "large" (ex. grille 6 colonnes d'underlying
-        shares) qui serait remonté par mégarde — ce clonage produirait des
-        lignes XML incohérentes dans un tableau cible 2-colonnes.
+        Priorité : "Currency" > "Trade Date" > n'importe quelle ligne avec 2+ colonnes > dernière ligne
         """
         # Liste des titres à chercher dans l'ordre de priorité
         reference_titles = ["currency", "trade date"]
@@ -779,17 +801,16 @@ class _TermSheetEditor:
         for title_to_search in reference_titles:
             for row in table.rows:
                 tcs = row._tr.findall(qn("w:tc"))
-                if 2 <= len(tcs) <= 3 and norm(row.cells[0].text) == title_to_search:
+                if len(tcs) >= 2 and norm(row.cells[0].text) == title_to_search:
                     return row
         
-        # Fallback : chercher n'importe quelle ligne "simple" à 2-3 cellules réelles
+        # Fallback : chercher n'importe quelle ligne "simple" à 2 cellules réelles
         for row in table.rows:
             tcs = row._tr.findall(qn("w:tc"))
-            if 2 <= len(tcs) <= 3:
+            if len(tcs) >= 2:
                 return row
         
-        # Dernier fallback : la dernière ligne (legacy ; peut renvoyer None
-        # implicitement si table.rows est vide)
+        # Dernier fallback : la dernière ligne
         return table.rows[-1] if table.rows else None
 
     def _find_section_row(self, section_title: str, occurrence: int = 1):
@@ -827,43 +848,171 @@ class _TermSheetEditor:
                     count += self._count_occurrences_in_table(nested, target)
         return None
 
-    def _is_empty_title_cell(self, cell) -> bool:
+    def _find_section_row_group(self, section_title: str, occurrence: int = 1):
         """
-        Indique si une cellule de titre est "vide" au sens d'une ligne de continuation :
-        vide après _normalize, ou ne contenant que de la ponctuation/espaces.
-        """
-        text = self._normalize(cell.text)
-        if not text:
-            return True
-        # Ne contient que de la ponctuation / symboles (pas de lettre ni de chiffre)
-        return not re.search(r"\w", text, flags=re.UNICODE)
+        Retourne (main_row, continuation_rows, table) pour une section.
 
-    def _find_continuation_rows(self, table, title_row) -> List:
+        Les continuation_rows sont les lignes qui suivent immédiatement main_row
+        et dont la colonne titre (cells[0]) est vide. Ce cas se produit quand
+        l'auteur du document a oublié de fusionner les cellules : A1 contient
+        le titre, A2/A3 sont vides, et B1/B2/B3 forment ensemble la description.
         """
-        Retourne les lignes de continuation d'une section : lignes du même tableau,
-        situées immédiatement après title_row, dont la cellule de titre (cells[0])
-        est vide ou ne contient que de la ponctuation. La recherche s'arrête au
-        premier titre non vide rencontré.
+        main_row, table = self._find_section_row(section_title, occurrence)
+        if main_row is None:
+            return None, [], None
 
-        Limitation documentée : la continuation n'est cherchée qu'au niveau plat
-        de `table` (pas dans les tableaux imbriqués), car une ligne fille d'une
-        section vit forcément au même niveau que sa ligne titre.
-        """
+        continuation_rows = []
         rows = list(table.rows)
         try:
-            idx = next(i for i, r in enumerate(rows) if r._tr is title_row._tr)
+            main_idx = next(i for i, r in enumerate(rows) if r._tr is main_row._tr)
+        except StopIteration:
+            return main_row, [], table
+
+        for row in rows[main_idx + 1:]:
+            if len(row.cells) >= 1 and self._normalize(row.cells[0].text) == "":
+                continuation_rows.append(row)
+            else:
+                break
+
+        return main_row, continuation_rows, table
+
+    # -----------------------------------------------------------------------
+    # Gestion des tableaux "description externe" (tableau standalone dans le body
+    # qui représente la description d'une section, quand l'auteur n'a pas inséré
+    # le tableau dans la cellule mais l'a mis directement dans le corps du document)
+    # -----------------------------------------------------------------------
+
+    def _is_two_col_table(self, table) -> bool:
+        """
+        Retourne True si le tableau est un tableau 2-colonnes titre/description.
+        Identifié par la majorité de ses lignes ayant exactement 2 <w:tc>.
+        """
+        if not table.rows:
+            return False
+        two_col_count = sum(
+            1 for row in table.rows
+            if len(row._tr.findall(qn("w:tc"))) == 2
+        )
+        return two_col_count > len(table.rows) / 2
+
+    def _get_body_two_col_tables(self):
+        """
+        Retourne, dans l'ordre du document, la liste des tableaux 2-colonnes
+        qui sont enfants directs du body (pas imbriqués dans une cellule).
+
+        Chaque entrée : (Table object, ext_group)
+        ext_group = liste des éléments body situés entre ce tableau 2-col et
+        le prochain tableau 2-col (ou fin du body). Contient typiquement des
+        paragraphes vides et/ou un tableau standalone décrivant la section.
+        """
+        body = self.doc.element.body
+
+        # Map id(_tbl) → Table object, uniquement pour les tableaux du body
+        body_tbl_map = {
+            id(tbl._tbl): tbl
+            for tbl in self.doc.tables
+            if tbl._tbl.getparent() is body
+        }
+
+        body_elems = list(body)
+        two_col_indices = []
+        for i, elem in enumerate(body_elems):
+            if elem.tag.split('}')[-1] == 'tbl' and id(elem) in body_tbl_map:
+                tbl_obj = body_tbl_map[id(elem)]
+                if self._is_two_col_table(tbl_obj):
+                    two_col_indices.append((i, tbl_obj))
+
+        result = []
+        for k, (idx, tbl_obj) in enumerate(two_col_indices):
+            next_idx = two_col_indices[k + 1][0] if k + 1 < len(two_col_indices) else len(body_elems)
+            ext_group = body_elems[idx + 1:next_idx]
+            result.append((tbl_obj, ext_group))
+        return result
+
+    def _find_external_group_for_last_row(self, table, last_row):
+        """
+        Si last_row est la dernière ligne de table, et que table est un tableau
+        2-col au niveau body suivi d'un tableau standalone (description externe),
+        retourne la liste des éléments body constituant ce groupe externe.
+        Sinon retourne [].
+        """
+        body = self.doc.element.body
+
+        if table._tbl.getparent() is not body:
+            return []
+        if not self._is_two_col_table(table):
+            return []
+
+        table_rows = list(table.rows)
+        if not table_rows or table_rows[-1]._tr is not last_row._tr:
+            return []
+
+        body_elems = list(body)
+        try:
+            tbl_idx = next(i for i, e in enumerate(body_elems) if e is table._tbl)
         except StopIteration:
             return []
 
-        continuations = []
-        for r in rows[idx + 1:]:
-            if len(r.cells) < 1:
+        ext_group = []
+        found_external_tbl = False
+        j = tbl_idx + 1
+        while j < len(body_elems):
+            elem = body_elems[j]
+            tag = elem.tag.split('}')[-1]
+            if tag == 'p':
+                ext_group.append(elem)
+                j += 1
+            elif tag == 'tbl':
+                tbl_obj = next((t for t in self.doc.tables if t._tbl is elem), None)
+                if tbl_obj and not self._is_two_col_table(tbl_obj):
+                    ext_group.append(elem)
+                    found_external_tbl = True
+                    j += 1
+                    # Inclure les paragraphes qui suivent le tableau externe
+                    while j < len(body_elems) and body_elems[j].tag.split('}')[-1] == 'p':
+                        ext_group.append(body_elems[j])
+                        j += 1
                 break
-            if self._is_empty_title_cell(r.cells[0]):
-                continuations.append(r)
             else:
                 break
-        return continuations
+
+        return ext_group if found_external_tbl else []
+
+    def _split_table_after_row(self, tr_elem, ext_group):
+        """
+        Coupe le tableau contenant tr_elem après cette ligne.
+        Insère ext_group dans le body juste après, puis crée un tableau
+        de continuation avec les lignes suivantes (en copiant tblPr/tblGrid).
+        """
+        tbl_elem = tr_elem.getparent()
+        body = tbl_elem.getparent()
+
+        all_trs = [e for e in tbl_elem if e.tag.split('}')[-1] == 'tr']
+        tr_idx = next((i for i, tr in enumerate(all_trs) if tr is tr_elem), None)
+        if tr_idx is None:
+            return
+
+        trs_after = all_trs[tr_idx + 1:]
+
+        # Insérer ext_group juste après tbl_elem
+        insert_point = tbl_elem
+        for ext_elem in ext_group:
+            insert_point.addnext(ext_elem)
+            insert_point = ext_elem
+
+        if trs_after:
+            # Créer un tableau de continuation avec tblPr + tblGrid du tableau original
+            new_tbl = OxmlElement('w:tbl')
+            tbl_pr = tbl_elem.find(qn('w:tblPr'))
+            if tbl_pr is not None:
+                new_tbl.append(deepcopy(tbl_pr))
+            tbl_grid = tbl_elem.find(qn('w:tblGrid'))
+            if tbl_grid is not None:
+                new_tbl.append(deepcopy(tbl_grid))
+            for tr in trs_after:
+                tbl_elem.remove(tr)
+                new_tbl.append(tr)
+            insert_point.addnext(new_tbl)
 
     def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str, red_highlight: bool = False, insert_after_row=None):
         """
