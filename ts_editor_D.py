@@ -347,36 +347,12 @@ class _TermSheetEditor:
         if main_row is None:
             return self
         all_rows = [main_row] + continuation_rows
-
-        # Détecter un éventuel tableau externe associé (si la dernière ligne du groupe
-        # est aussi la dernière ligne du tableau 2-col parent)
-        ext_group = self._find_external_group_for_last_row(table, all_rows[-1])
-
         if self.markup_mode:
             for row in all_rows:
                 self._strike_row(row)
-            # En mode markup on barre aussi le contenu du tableau externe
-            if ext_group:
-                for elem in ext_group:
-                    if elem.tag.split('}')[-1] == 'tbl':
-                        for tr in elem.findall('.//' + qn('w:tr')):
-                            for tc in tr.findall(qn('w:tc')):
-                                for p in tc.findall('.//' + qn('w:p')):
-                                    for r in p.findall(qn('w:r')):
-                                        rpr = r.find(qn('w:rPr'))
-                                        if rpr is None:
-                                            rpr = OxmlElement('w:rPr')
-                                            r.insert(0, rpr)
-                                        strike = OxmlElement('w:strike')
-                                        rpr.append(strike)
         else:
             for row in all_rows:
                 table._tbl.remove(row._tr)
-            if ext_group:
-                body = self.doc.element.body
-                for elem in ext_group:
-                    if elem.getparent() is body:
-                        body.remove(elem)
         return self
 
     def _strike_row(self, row):
@@ -493,118 +469,117 @@ class _TermSheetEditor:
     def _find_main_table(self):
         """
         Retourne le tableau principal du document :
-        le tableau à 2+ colonnes ayant le plus grand nombre de lignes.
-        Repli sur doc.tables[0] si aucun tableau à 2 colonnes n'est trouvé.
+        le tableau "2-colonnes" (titre/description) ayant le plus grand nombre de lignes.
+
+        Un tableau est considéré 2-col si la majorité de ses lignes ont exactement
+        2 cellules. Cela exclut les tableaux à colonnes multiples (par ex. tableaux
+        de description externes à 5+ colonnes) qui ne doivent jamais être traités
+        comme tableau principal.
         """
         best = None
         best_rows = -1
         for table in self.doc.tables:
-            has_two_cols = any(len(row.cells) >= 2 for row in table.rows)
-            if has_two_cols and len(table.rows) > best_rows:
+            if not table.rows:
+                continue
+            two_col_count = sum(
+                1 for row in table.rows
+                if len(row._tr.findall(qn("w:tc"))) == 2
+            )
+            if two_col_count > len(table.rows) / 2 and len(table.rows) > best_rows:
                 best = table
                 best_rows = len(table.rows)
         return best if best is not None else (self.doc.tables[0] if self.doc.tables else None)
 
     def set_section_order(self, section_order: List[str]):
         """
-        Réorganise les sections selon l'ordre demandé.
+        Réorganise les lignes du tableau principal selon l'ordre demandé.
 
-        Principe : chaque segment de tableau 2-col est trié indépendamment.
-        Aucune ligne n'est déplacée d'un tableau à un autre (pas de fusion/recréation
-        de tableaux, ce qui préserve parfaitement les largeurs de colonnes et la
-        mise en forme).
-
-        Gestion des tableaux externes : si, après tri, la section qui "possède" un
-        tableau externe (standalone dans le body) n'est plus la dernière ligne de
-        son segment, le segment est coupé en deux à cet endroit via deepcopy afin
-        que le tableau externe reste visuellement attaché à sa section.
+        Principe : on tri uniquement les lignes 2-colonnes (titre/description).
+        Les lignes ayant un nombre de colonnes différent (en-tête fusionné sur
+        toute la largeur, sous-tableau imbriqué, etc.) sont considérées comme
+        des ancres fixes et ne sont jamais déplacées.
 
         Contraintes :
-        - La première ligne du premier tableau 2-col reste fixe.
+        - La première ligne du tableau reste fixe quoi qu'il arrive.
+        - Les lignes non 2-col restent à leur position d'origine.
         - Les titres absents du document sont ignorés (aucune création).
         - Les lignes non listées sont conservées à la fin (ordre relatif inchangé).
+        - Les tableaux à >2 colonnes (descriptions externes standalone) ne sont
+          jamais touchés et restent à leur position dans le body.
         """
         if not self.doc.tables:
             return self
 
-        two_col_data = self._get_body_two_col_tables()
-
-        if not two_col_data:
-            table = self._find_main_table()
-            if table:
-                self._sort_rows_in_table(table, section_order)
+        table = self._find_main_table()
+        if table is None or not table.rows:
             return self
 
-        order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
-        default_rank = len(order_map)
+        all_rows = list(table.rows)
 
-        for i, (tbl_obj, ext_group) in enumerate(two_col_data):
-            if not tbl_obj.rows:
-                continue
-
-            # Identifier si ce tableau possède un tableau externe (non-2col qui suit dans le body)
-            has_ext_tbl = any(e.tag.split('}')[-1] == 'tbl' for e in ext_group)
-            owner_tr = tbl_obj.rows[-1]._tr if has_ext_tbl else None
-
-            # La première ligne du premier tableau est fixe
-            start = 1 if i == 0 else 0
-            movable_rows = list(tbl_obj.rows)[start:]
-            if not movable_rows:
-                continue
-
-            # Calculer les rangs
-            ranked_rows = []
-            for orig_pos, row in enumerate(movable_rows):
-                title_text = row.cells[0].text if row.cells else ""
-                rank = order_map.get(self._normalize(title_text), default_rank)
-                ranked_rows.append((rank, orig_pos, row))
-            ranked_rows.sort(key=lambda x: (x[0], x[1]))
-
-            # Retirer puis réinsérer dans l'ordre trié
-            tbl = tbl_obj._tbl
-            for row in movable_rows:
-                tbl.remove(row._tr)
-
-            if start > 0:
-                # Premier tableau : insérer après la ligne fixe
-                cursor_tr = tbl_obj.rows[0]._tr
-                for _, _, row in ranked_rows:
-                    cursor_tr.addnext(row._tr)
-                    cursor_tr = row._tr
+        # Identifier les indices des lignes "fixes" (non 2-colonnes) et "mobiles" (2-colonnes)
+        # La première ligne est toujours fixe.
+        fixed_indices = {0}
+        movable_indices = []
+        for idx in range(1, len(all_rows)):
+            row = all_rows[idx]
+            num_tcs = len(row._tr.findall(qn("w:tc")))
+            if num_tcs == 2:
+                movable_indices.append(idx)
             else:
-                # Tableaux suivants : pas de ligne fixe, simple append dans l'ordre
-                for _, _, row in ranked_rows:
-                    tbl.append(row._tr)
+                fixed_indices.add(idx)
 
-            # Si l'owner du tableau externe n'est plus la dernière ligne, couper le tableau
-            if owner_tr is not None:
-                current_rows = list(tbl_obj.rows)
-                if current_rows and current_rows[-1]._tr is not owner_tr:
-                    self._split_table_after_row(owner_tr, ext_group)
-
-        return self
-
-    def _sort_rows_in_table(self, table, section_order: List[str]):
-        """Tri simple des lignes au sein d'un unique tableau (comportement original)."""
-        if not table.rows:
+        if not movable_indices:
             return self
-        fixed_first_row = table.rows[0]
-        movable_rows = list(table.rows[1:])
+
+        # Calculer le rang de chaque ligne mobile
         order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
         default_rank = len(order_map)
-        ranked_rows = []
-        for original_pos, row in enumerate(movable_rows):
+
+        ranked = []
+        for orig_pos, idx in enumerate(movable_indices):
+            row = all_rows[idx]
             first_cell_text = row.cells[0].text if len(row.cells) >= 1 else ""
             rank = order_map.get(self._normalize(first_cell_text), default_rank)
-            ranked_rows.append((rank, original_pos, row))
-        ranked_rows.sort(key=lambda x: (x[0], x[1]))
+            ranked.append((rank, orig_pos, idx))
+        ranked.sort(key=lambda x: (x[0], x[1]))
+        sorted_movable_indices = [item[2] for item in ranked]
+
+        # Construire la nouvelle séquence d'indices :
+        # parcourir l'ordre original, garder les lignes fixes à leur place,
+        # et pour chaque "slot" de ligne mobile, piocher dans sorted_movable_indices.
+        new_order_indices = []
+        movable_iter = iter(sorted_movable_indices)
+        for idx in range(len(all_rows)):
+            if idx in fixed_indices:
+                new_order_indices.append(idx)
+            else:
+                new_order_indices.append(next(movable_iter))
+
+        # Si l'ordre n'a pas changé, on évite toute manipulation XML
+        if new_order_indices == list(range(len(all_rows))):
+            return self
+
+        # Réordonnancement XML : retirer toutes les lignes mobiles puis les réinsérer
+        # dans l'ordre voulu, en utilisant les ancres fixes comme repères.
         tbl = table._tbl
-        for row in movable_rows:
-            tbl.remove(row._tr)
-        cursor_tr = fixed_first_row._tr
-        for _, _, row in ranked_rows:
-            cursor_tr.addnext(row._tr)
-            cursor_tr = row._tr
+        for idx in movable_indices:
+            tbl.remove(all_rows[idx]._tr)
+
+        # Reconstruire en parcourant new_order_indices :
+        # pour chaque indice fixe, on l'utilise comme curseur et on insère après lui
+        # les lignes mobiles qui le suivent dans new_order_indices, jusqu'au prochain fixe.
+        cursor_tr = None
+        for idx in new_order_indices:
+            if idx in fixed_indices:
+                cursor_tr = all_rows[idx]._tr
+            else:
+                if cursor_tr is None:
+                    # Ne devrait pas arriver puisque idx 0 est toujours fixe
+                    tbl.append(all_rows[idx]._tr)
+                else:
+                    cursor_tr.addnext(all_rows[idx]._tr)
+                cursor_tr = all_rows[idx]._tr
+
         return self
 
     def _set_cell_text(self, cell, text: str, highlight: bool = False, red_highlight: bool = False):
@@ -863,146 +838,6 @@ class _TermSheetEditor:
                 break
 
         return main_row, continuation_rows, table
-
-    # -----------------------------------------------------------------------
-    # Gestion des tableaux "description externe" (tableau standalone dans le body
-    # qui représente la description d'une section, quand l'auteur n'a pas inséré
-    # le tableau dans la cellule mais l'a mis directement dans le corps du document)
-    # -----------------------------------------------------------------------
-
-    def _is_two_col_table(self, table) -> bool:
-        """
-        Retourne True si le tableau est un tableau 2-colonnes titre/description.
-        Identifié par la majorité de ses lignes ayant exactement 2 <w:tc>.
-        """
-        if not table.rows:
-            return False
-        two_col_count = sum(
-            1 for row in table.rows
-            if len(row._tr.findall(qn("w:tc"))) == 2
-        )
-        return two_col_count > len(table.rows) / 2
-
-    def _get_body_two_col_tables(self):
-        """
-        Retourne, dans l'ordre du document, la liste des tableaux 2-colonnes
-        qui sont enfants directs du body (pas imbriqués dans une cellule).
-
-        Chaque entrée : (Table object, ext_group)
-        ext_group = liste des éléments body situés entre ce tableau 2-col et
-        le prochain tableau 2-col (ou fin du body). Contient typiquement des
-        paragraphes vides et/ou un tableau standalone décrivant la section.
-        """
-        body = self.doc.element.body
-
-        # Map id(_tbl) → Table object, uniquement pour les tableaux du body
-        body_tbl_map = {
-            id(tbl._tbl): tbl
-            for tbl in self.doc.tables
-            if tbl._tbl.getparent() is body
-        }
-
-        body_elems = list(body)
-        two_col_indices = []
-        for i, elem in enumerate(body_elems):
-            if elem.tag.split('}')[-1] == 'tbl' and id(elem) in body_tbl_map:
-                tbl_obj = body_tbl_map[id(elem)]
-                if self._is_two_col_table(tbl_obj):
-                    two_col_indices.append((i, tbl_obj))
-
-        result = []
-        for k, (idx, tbl_obj) in enumerate(two_col_indices):
-            next_idx = two_col_indices[k + 1][0] if k + 1 < len(two_col_indices) else len(body_elems)
-            ext_group = body_elems[idx + 1:next_idx]
-            result.append((tbl_obj, ext_group))
-        return result
-
-    def _find_external_group_for_last_row(self, table, last_row):
-        """
-        Si last_row est la dernière ligne de table, et que table est un tableau
-        2-col au niveau body suivi d'un tableau standalone (description externe),
-        retourne la liste des éléments body constituant ce groupe externe.
-        Sinon retourne [].
-        """
-        body = self.doc.element.body
-
-        if table._tbl.getparent() is not body:
-            return []
-        if not self._is_two_col_table(table):
-            return []
-
-        table_rows = list(table.rows)
-        if not table_rows or table_rows[-1]._tr is not last_row._tr:
-            return []
-
-        body_elems = list(body)
-        try:
-            tbl_idx = next(i for i, e in enumerate(body_elems) if e is table._tbl)
-        except StopIteration:
-            return []
-
-        ext_group = []
-        found_external_tbl = False
-        j = tbl_idx + 1
-        while j < len(body_elems):
-            elem = body_elems[j]
-            tag = elem.tag.split('}')[-1]
-            if tag == 'p':
-                ext_group.append(elem)
-                j += 1
-            elif tag == 'tbl':
-                tbl_obj = next((t for t in self.doc.tables if t._tbl is elem), None)
-                if tbl_obj and not self._is_two_col_table(tbl_obj):
-                    ext_group.append(elem)
-                    found_external_tbl = True
-                    j += 1
-                    # Inclure les paragraphes qui suivent le tableau externe
-                    while j < len(body_elems) and body_elems[j].tag.split('}')[-1] == 'p':
-                        ext_group.append(body_elems[j])
-                        j += 1
-                break
-            else:
-                break
-
-        return ext_group if found_external_tbl else []
-
-    def _split_table_after_row(self, tr_elem, ext_group):
-        """
-        Coupe le tableau contenant tr_elem après cette ligne.
-
-        Le tableau de continuation est créé par deepcopy du tableau original
-        (préserve intégralement tblPr, tblGrid, largeurs de colonnes, bordures, etc.)
-        puis les lignes qui suivent le point de coupure y sont déplacées.
-
-        Les éléments ext_group sont repositionnés entre le tableau original (tronqué)
-        et le tableau de continuation via addnext (déplacement dans le body XML).
-        """
-        tbl_elem = tr_elem.getparent()
-
-        all_trs = [e for e in tbl_elem if e.tag.split('}')[-1] == 'tr']
-        tr_idx = next((i for i, tr in enumerate(all_trs) if tr is tr_elem), None)
-        if tr_idx is None:
-            return
-
-        trs_after = all_trs[tr_idx + 1:]
-
-        # Repositionner ext_group juste après tbl_elem (addnext déplace l'élément dans le body)
-        insert_point = tbl_elem
-        for ext_elem in ext_group:
-            insert_point.addnext(ext_elem)
-            insert_point = ext_elem
-
-        if trs_after:
-            # Tableau de continuation = deepcopy exact du tableau d'origine (structure complète)
-            new_tbl = deepcopy(tbl_elem)
-            # Vider le deepcopy de ses lignes (on y mettra les lignes originales)
-            for tr in list(new_tbl.findall(qn('w:tr'))):
-                new_tbl.remove(tr)
-            # Déplacer les lignes qui suivent le point de coupure vers le nouveau tableau
-            for tr in trs_after:
-                tbl_elem.remove(tr)
-                new_tbl.append(tr)
-            insert_point.addnext(new_tbl)
 
     def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str, red_highlight: bool = False, insert_after_row=None):
         """
