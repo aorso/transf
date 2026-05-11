@@ -527,35 +527,35 @@ class _TermSheetEditor:
                 self._create_minimal_row_after(table, format_row, title, description, red_highlight, insert_after_row=last_row)
         return self
 
-    def _is_two_col_table(self, table) -> bool:
+    def _is_section_table(self, table) -> bool:
         """
-        Détecte si un tableau est un tableau "titre/description" à 2 colonnes.
+        Retourne True si le tableau est un tableau titre/description à 2 colonnes.
 
-        Critère : la majorité stricte des lignes du tableau ont exactement 2 cellules
-        XML `<w:tc>`. Cela permet d'identifier les tableaux de description externes
-        (5+ colonnes) qui ne doivent jamais être confondus avec le tableau principal
-        de sections titre/description.
+        Critère : plus de la moitié des lignes directes ont exactement 2 cellules
+        (<w:tc>). Cela exclut les tableaux dont certaines lignes ont 3+ colonnes
+        (tableaux de données standalone à 5+ colonnes) qui ne doivent jamais être
+        traités comme des tableaux de sections.
         """
         if not table.rows:
             return False
-        two_col_count = sum(
+        two_col = sum(
             1 for row in table.rows
             if len(row._tr.findall(qn("w:tc"))) == 2
         )
-        return two_col_count > len(table.rows) / 2
+        return two_col > len(table.rows) / 2
 
     def _find_main_table(self):
         """
-        Retourne le tableau principal du document :
-        le tableau "2-colonnes" titre/description ayant le plus grand nombre de lignes.
+        Retourne le tableau principal titre/description du document.
 
-        Les tableaux à >2 colonnes (descriptions externes standalone) sont exclus.
-        Repli sur doc.tables[0] si aucun tableau 2-col n'est trouvé.
+        Parmi les tableaux qualifiés par _is_section_table, retourne celui
+        qui a le plus grand nombre de lignes. Les tableaux à colonnes multiples
+        (descriptions externes standalone) sont exclus.
         """
         best = None
         best_rows = -1
         for table in self.doc.tables:
-            if self._is_two_col_table(table) and len(table.rows) > best_rows:
+            if self._is_section_table(table) and len(table.rows) > best_rows:
                 best = table
                 best_rows = len(table.rows)
         return best if best is not None else (self.doc.tables[0] if self.doc.tables else None)
@@ -803,16 +803,14 @@ class _TermSheetEditor:
 
     def _find_section_row(self, section_title: str, occurrence: int = 1):
         """
-        Cherche une ligne de section dans les tableaux 2-colonnes uniquement.
-
-        Les tableaux à >2 colonnes (descriptions externes) sont entièrement ignorés
-        pour éviter qu'un titre de section corresponde par erreur au contenu d'une
-        cellule de tableau 5-colonnes.
+        Cherche une ligne de section uniquement dans les tableaux titre/description
+        qualifiés par _is_section_table. Les tableaux à colonnes multiples (5-col,
+        etc.) sont entièrement ignorés.
         """
         target = self._normalize(section_title)
         count = 0
         for table in self.doc.tables:
-            if not self._is_two_col_table(table):
+            if not self._is_section_table(table):
                 continue
             row = self._find_section_row_in_table(table, target, occurrence, count)
             if row is not None:
@@ -821,8 +819,7 @@ class _TermSheetEditor:
         return None, None
 
     def _count_occurrences_in_table(self, table, target: str) -> int:
-        """Compte les occurrences du titre, en restant dans les tableaux 2-col."""
-        if not self._is_two_col_table(table):
+        if not self._is_section_table(table):
             return 0
         c = 0
         for row in table.rows:
@@ -834,8 +831,7 @@ class _TermSheetEditor:
         return c
 
     def _find_section_row_in_table(self, table, target: str, occurrence: int, count_so_far: int = 0):
-        """Cherche la n-ième ligne au titre demandé, en restant dans les tableaux 2-col."""
-        if not self._is_two_col_table(table):
+        if not self._is_section_table(table):
             return None
         count = count_so_far
         for row in table.rows:
