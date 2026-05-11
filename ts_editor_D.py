@@ -328,31 +328,86 @@ class _TermSheetEditor:
         if not self.markup_mode:
             dst_run.font.highlight_color = None
 
+    def _section_block_rows(self, table, title_row):
+        """
+        Lignes consécutives d'une même section lorsque la colonne titre (A) n'est pas fusionnée :
+        première ligne = titre en A ; lignes suivantes avec A vide = suite de la description (texte en B).
+        """
+        rows_list = table.rows
+        start_idx = None
+        for i, r in enumerate(rows_list):
+            if r._tr is title_row._tr:
+                start_idx = i
+                break
+        if start_idx is None:
+            return [title_row]
+        block = []
+        for j in range(start_idx, len(rows_list)):
+            r = rows_list[j]
+            if j == start_idx:
+                block.append(r)
+                continue
+            first = r.cells[0].text if len(r.cells) >= 1 else ""
+            if self._normalize(first):
+                break
+            block.append(r)
+        return block
+
+    def _aggregate_description_from_block(self, block_rows) -> str:
+        parts = []
+        for r in block_rows:
+            if len(r.cells) >= 2:
+                parts.append(r.cells[1].text)
+        return "\n".join(parts).strip()
+
+    def _apply_description_to_block(
+        self, block_rows, description: str, highlight: bool, red_highlight: bool
+    ):
+        """Écrit toute la description dans la première cellule B du bloc et vide les B suivantes."""
+        if not block_rows:
+            return
+        first_desc = True
+        for r in block_rows:
+            if len(r.cells) >= 2:
+                if first_desc:
+                    self._set_cell_text(
+                        r.cells[1],
+                        description,
+                        highlight=highlight,
+                        red_highlight=red_highlight,
+                    )
+                    first_desc = False
+                else:
+                    self._set_cell_text(r.cells[1], "", highlight=False, red_highlight=False)
+
     def update_section_description(self, section_title: str, new_description: str, occurrence: int = 1):
-        main_row, continuation_rows, _ = self._find_section_row_group(section_title, occurrence)
-        if main_row is None:
+        row, table = self._find_section_row(section_title, occurrence)
+        if row is None:
             return self
-        if len(main_row.cells) >= 2:
-            self._set_cell_text(main_row.cells[1], new_description, highlight=self.markup_mode)
-            for row in continuation_rows:
-                if len(row.cells) >= 2:
-                    self._set_cell_text(row.cells[1], "", highlight=False)
-        elif len(main_row.cells) == 1:
-            title = self._normalize(main_row.cells[0].text)
-            self._set_cell_text(main_row.cells[0], f"{title}: {new_description}", highlight=self.markup_mode)
+        if len(row.cells) >= 2:
+            block = self._section_block_rows(table, row)
+            self._apply_description_to_block(
+                block, new_description, highlight=self.markup_mode, red_highlight=False
+            )
+        elif len(row.cells) == 1:
+            title = self._normalize(row.cells[0].text)
+            self._set_cell_text(row.cells[0], f"{title}: {new_description}", highlight=self.markup_mode)
         return self
 
     def delete_section(self, section_title: str, occurrence: int = 1):
-        main_row, continuation_rows, table = self._find_section_row_group(section_title, occurrence)
-        if main_row is None:
+        row, table = self._find_section_row(section_title, occurrence)
+        if row is None:
             return self
-        all_rows = [main_row] + continuation_rows
-        if self.markup_mode:
-            for row in all_rows:
-                self._strike_row(row)
+        if len(row.cells) >= 2:
+            block = self._section_block_rows(table, row)
         else:
-            for row in all_rows:
-                table._tbl.remove(row._tr)
+            block = [row]
+        if self.markup_mode:
+            for r in block:
+                self._strike_row(r)
+        else:
+            for r in reversed(block):
+                table._tbl.remove(r._tr)
         return self
 
     def _strike_row(self, row):
@@ -366,26 +421,19 @@ class _TermSheetEditor:
     def get_section_description(self, section_title: str, occurrence: int = 1) -> Optional[str]:
         """
         Lit la description d'une section et la retourne sous forme de string.
-
-        Gère les cellules non fusionnées : si des lignes à titre vide suivent
-        la ligne principale (A2/A3 vides, B2/B3 avec contenu), leurs descriptions
-        sont assemblées en un seul texte séparé par des sauts de ligne.
-
-        Retourne None si la section est introuvable.
+        - Retourne None si la section est introuvable.
+        - Pour les lignes à 2 colonnes : concatène les cellules B des lignes consécutives dont la
+          colonne A est vide après la ligne titre (cas sans fusion verticale).
+        - Pour les lignes à 1 colonne (format "Titre: description") : retourne la partie après le premier ':'.
         """
-        main_row, continuation_rows, _ = self._find_section_row_group(section_title, occurrence)
-        if main_row is None:
+        row, table = self._find_section_row(section_title, occurrence)
+        if row is None:
             return None
-        if len(main_row.cells) >= 2:
-            parts = []
-            for row in [main_row] + continuation_rows:
-                if len(row.cells) >= 2:
-                    text = row.cells[1].text
-                    if text.strip():
-                        parts.append(text)
-            return "\n".join(parts)
-        if len(main_row.cells) == 1:
-            text = main_row.cells[0].text
+        if len(row.cells) >= 2:
+            block = self._section_block_rows(table, row)
+            return self._aggregate_description_from_block(block)
+        if len(row.cells) == 1:
+            text = row.cells[0].text
             if ":" in text:
                 return text.split(":", 1)[1].strip()
         return None
@@ -394,7 +442,14 @@ class _TermSheetEditor:
         ref_row, table = self._find_section_row(after_section, occurrence)
         if ref_row is None:
             raise ValueError(f"Section de référence introuvable : {after_section}")
-        new_row = self._create_minimal_row_after(table, ref_row, new_title, new_description)
+        anchor = (
+            self._section_block_rows(table, ref_row)[-1]
+            if len(ref_row.cells) >= 2
+            else ref_row
+        )
+        self._create_minimal_row_after(
+            table, ref_row, new_title, new_description, insert_after_row=anchor
+        )
         return self
 
     def set_section(
@@ -407,27 +462,28 @@ class _TermSheetEditor:
     ):
         """
         Ajoute ou met à jour une section.
-        - Si la section existe : met à jour la description
-        - Si la section n'existe pas : l'ajoute après after_section (ou à la fin si None)
+        - Si la section existe : met à jour la description (tout le texte est regroupé dans la
+          première cellule B du bloc ; les lignes de continuation avec colonne A vide sont vidées en B)
+        - Si la section n'existe pas : l'ajoute après after_section (ou à la fin si None).
+          Si after_section désigne une section multi-lignes sans fusion, l'insertion se fait après
+          la dernière ligne de ce bloc.
         """
-        main_row, continuation_rows, table = self._find_section_row_group(title, occurrence)
-
-        if main_row is not None:
+        row, table = self._find_section_row(title, occurrence)
+        
+        if row is not None:
             # Section existe : mise à jour de la description
-            if len(main_row.cells) >= 2:
-                self._set_cell_text(
-                    main_row.cells[1], 
-                    description, 
+            if len(row.cells) >= 2:
+                block = self._section_block_rows(table, row)
+                self._apply_description_to_block(
+                    block,
+                    description,
                     highlight=self.markup_mode,
-                    red_highlight=red_highlight and not self.markup_mode
+                    red_highlight=red_highlight and not self.markup_mode,
                 )
-                for cont_row in continuation_rows:
-                    if len(cont_row.cells) >= 2:
-                        self._set_cell_text(cont_row.cells[1], "", highlight=False)
-            elif len(main_row.cells) == 1:
-                norm_title = self._normalize(main_row.cells[0].text)
+            elif len(row.cells) == 1:
+                norm_title = self._normalize(row.cells[0].text)
                 self._set_cell_text(
-                    main_row.cells[0], 
+                    row.cells[0], 
                     f"{norm_title}: {description}",
                     highlight=self.markup_mode,
                     red_highlight=red_highlight and not self.markup_mode
@@ -442,13 +498,18 @@ class _TermSheetEditor:
                 # Utiliser une ligne de référence "standard" pour le style
                 # et insérer à l'endroit demandé (après ref_row).
                 format_row = self._find_reference_row_for_format(table) or ref_row
+                anchor = (
+                    self._section_block_rows(table, ref_row)[-1]
+                    if len(ref_row.cells) >= 2
+                    else ref_row
+                )
                 self._create_minimal_row_after(
                     table,
                     format_row,
                     title,
                     description,
                     red_highlight,
-                    insert_after_row=ref_row,
+                    insert_after_row=anchor,
                 )
             else:
                 # Ajouter à la fin du tableau principal
@@ -466,26 +527,35 @@ class _TermSheetEditor:
                 self._create_minimal_row_after(table, format_row, title, description, red_highlight, insert_after_row=last_row)
         return self
 
+    def _is_two_col_table(self, table) -> bool:
+        """
+        Détecte si un tableau est un tableau "titre/description" à 2 colonnes.
+
+        Critère : la majorité stricte des lignes du tableau ont exactement 2 cellules
+        XML `<w:tc>`. Cela permet d'identifier les tableaux de description externes
+        (5+ colonnes) qui ne doivent jamais être confondus avec le tableau principal
+        de sections titre/description.
+        """
+        if not table.rows:
+            return False
+        two_col_count = sum(
+            1 for row in table.rows
+            if len(row._tr.findall(qn("w:tc"))) == 2
+        )
+        return two_col_count > len(table.rows) / 2
+
     def _find_main_table(self):
         """
         Retourne le tableau principal du document :
-        le tableau "2-colonnes" (titre/description) ayant le plus grand nombre de lignes.
+        le tableau "2-colonnes" titre/description ayant le plus grand nombre de lignes.
 
-        Un tableau est considéré 2-col si la majorité de ses lignes ont exactement
-        2 cellules. Cela exclut les tableaux à colonnes multiples (par ex. tableaux
-        de description externes à 5+ colonnes) qui ne doivent jamais être traités
-        comme tableau principal.
+        Les tableaux à >2 colonnes (descriptions externes standalone) sont exclus.
+        Repli sur doc.tables[0] si aucun tableau 2-col n'est trouvé.
         """
         best = None
         best_rows = -1
         for table in self.doc.tables:
-            if not table.rows:
-                continue
-            two_col_count = sum(
-                1 for row in table.rows
-                if len(row._tr.findall(qn("w:tc"))) == 2
-            )
-            if two_col_count > len(table.rows) / 2 and len(table.rows) > best_rows:
+            if self._is_two_col_table(table) and len(table.rows) > best_rows:
                 best = table
                 best_rows = len(table.rows)
         return best if best is not None else (self.doc.tables[0] if self.doc.tables else None)
@@ -493,92 +563,47 @@ class _TermSheetEditor:
     def set_section_order(self, section_order: List[str]):
         """
         Réorganise les lignes du tableau principal selon l'ordre demandé.
-
-        Principe : on tri uniquement les lignes 2-colonnes (titre/description).
-        Les lignes ayant un nombre de colonnes différent (en-tête fusionné sur
-        toute la largeur, sous-tableau imbriqué, etc.) sont considérées comme
-        des ancres fixes et ne sont jamais déplacées.
-
-        Contraintes :
+        Contraintes:
         - La première ligne du tableau reste fixe quoi qu'il arrive.
-        - Les lignes non 2-col restent à leur position d'origine.
         - Les titres absents du document sont ignorés (aucune création).
         - Les lignes non listées sont conservées à la fin (ordre relatif inchangé).
-        - Les tableaux à >2 colonnes (descriptions externes standalone) ne sont
-          jamais touchés et restent à leur position dans le body.
+        - Les lignes sont déplacées telles quelles (style/format inchangés).
         """
         if not self.doc.tables:
             return self
 
         table = self._find_main_table()
-        if table is None or not table.rows:
+        if not table.rows:
             return self
 
-        all_rows = list(table.rows)
-
-        # Identifier les indices des lignes "fixes" (non 2-colonnes) et "mobiles" (2-colonnes)
-        # La première ligne est toujours fixe.
-        fixed_indices = {0}
-        movable_indices = []
-        for idx in range(1, len(all_rows)):
-            row = all_rows[idx]
-            num_tcs = len(row._tr.findall(qn("w:tc")))
-            if num_tcs == 2:
-                movable_indices.append(idx)
-            else:
-                fixed_indices.add(idx)
-
-        if not movable_indices:
+        fixed_first_row = table.rows[0]
+        movable_rows = list(table.rows[1:])
+        if not movable_rows:
             return self
 
-        # Calculer le rang de chaque ligne mobile
+        # Même normalisation que celle utilisée pour lire les titres du document.
         order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
         default_rank = len(order_map)
 
-        ranked = []
-        for orig_pos, idx in enumerate(movable_indices):
-            row = all_rows[idx]
+        # Tri stable: d'abord ordre demandé, puis position d'origine.
+        ranked_rows = []
+        for original_pos, row in enumerate(movable_rows):
             first_cell_text = row.cells[0].text if len(row.cells) >= 1 else ""
-            rank = order_map.get(self._normalize(first_cell_text), default_rank)
-            ranked.append((rank, orig_pos, idx))
-        ranked.sort(key=lambda x: (x[0], x[1]))
-        sorted_movable_indices = [item[2] for item in ranked]
+            row_title = self._normalize(first_cell_text)
+            rank = order_map.get(row_title, default_rank)
+            ranked_rows.append((rank, original_pos, row))
 
-        # Construire la nouvelle séquence d'indices :
-        # parcourir l'ordre original, garder les lignes fixes à leur place,
-        # et pour chaque "slot" de ligne mobile, piocher dans sorted_movable_indices.
-        new_order_indices = []
-        movable_iter = iter(sorted_movable_indices)
-        for idx in range(len(all_rows)):
-            if idx in fixed_indices:
-                new_order_indices.append(idx)
-            else:
-                new_order_indices.append(next(movable_iter))
+        ranked_rows.sort(key=lambda x: (x[0], x[1]))
 
-        # Si l'ordre n'a pas changé, on évite toute manipulation XML
-        if new_order_indices == list(range(len(all_rows))):
-            return self
-
-        # Réordonnancement XML : retirer toutes les lignes mobiles puis les réinsérer
-        # dans l'ordre voulu, en utilisant les ancres fixes comme repères.
+        # Déplacement XML des mêmes <w:tr> => style et structure conservés.
         tbl = table._tbl
-        for idx in movable_indices:
-            tbl.remove(all_rows[idx]._tr)
+        for row in movable_rows:
+            tbl.remove(row._tr)
 
-        # Reconstruire en parcourant new_order_indices :
-        # pour chaque indice fixe, on l'utilise comme curseur et on insère après lui
-        # les lignes mobiles qui le suivent dans new_order_indices, jusqu'au prochain fixe.
-        cursor_tr = None
-        for idx in new_order_indices:
-            if idx in fixed_indices:
-                cursor_tr = all_rows[idx]._tr
-            else:
-                if cursor_tr is None:
-                    # Ne devrait pas arriver puisque idx 0 est toujours fixe
-                    tbl.append(all_rows[idx]._tr)
-                else:
-                    cursor_tr.addnext(all_rows[idx]._tr)
-                cursor_tr = all_rows[idx]._tr
+        cursor_tr = fixed_first_row._tr
+        for _, _, row in ranked_rows:
+            cursor_tr.addnext(row._tr)
+            cursor_tr = row._tr
 
         return self
 
@@ -777,9 +802,18 @@ class _TermSheetEditor:
         return table.rows[-1] if table.rows else None
 
     def _find_section_row(self, section_title: str, occurrence: int = 1):
+        """
+        Cherche une ligne de section dans les tableaux 2-colonnes uniquement.
+
+        Les tableaux à >2 colonnes (descriptions externes) sont entièrement ignorés
+        pour éviter qu'un titre de section corresponde par erreur au contenu d'une
+        cellule de tableau 5-colonnes.
+        """
         target = self._normalize(section_title)
         count = 0
         for table in self.doc.tables:
+            if not self._is_two_col_table(table):
+                continue
             row = self._find_section_row_in_table(table, target, occurrence, count)
             if row is not None:
                 return row, table
@@ -787,6 +821,9 @@ class _TermSheetEditor:
         return None, None
 
     def _count_occurrences_in_table(self, table, target: str) -> int:
+        """Compte les occurrences du titre, en restant dans les tableaux 2-col."""
+        if not self._is_two_col_table(table):
+            return 0
         c = 0
         for row in table.rows:
             if len(row.cells) >= 1 and self._normalize(row.cells[0].text) == target:
@@ -797,6 +834,9 @@ class _TermSheetEditor:
         return c
 
     def _find_section_row_in_table(self, table, target: str, occurrence: int, count_so_far: int = 0):
+        """Cherche la n-ième ligne au titre demandé, en restant dans les tableaux 2-col."""
+        if not self._is_two_col_table(table):
+            return None
         count = count_so_far
         for row in table.rows:
             if len(row.cells) >= 1 and self._normalize(row.cells[0].text) == target:
@@ -810,34 +850,6 @@ class _TermSheetEditor:
                         return found
                     count += self._count_occurrences_in_table(nested, target)
         return None
-
-    def _find_section_row_group(self, section_title: str, occurrence: int = 1):
-        """
-        Retourne (main_row, continuation_rows, table) pour une section.
-
-        Les continuation_rows sont les lignes qui suivent immédiatement main_row
-        et dont la colonne titre (cells[0]) est vide. Ce cas se produit quand
-        l'auteur du document a oublié de fusionner les cellules : A1 contient
-        le titre, A2/A3 sont vides, et B1/B2/B3 forment ensemble la description.
-        """
-        main_row, table = self._find_section_row(section_title, occurrence)
-        if main_row is None:
-            return None, [], None
-
-        continuation_rows = []
-        rows = list(table.rows)
-        try:
-            main_idx = next(i for i, r in enumerate(rows) if r._tr is main_row._tr)
-        except StopIteration:
-            return main_row, [], table
-
-        for row in rows[main_idx + 1:]:
-            if len(row.cells) >= 1 and self._normalize(row.cells[0].text) == "":
-                continuation_rows.append(row)
-            else:
-                break
-
-        return main_row, continuation_rows, table
 
     def _create_minimal_row_after(self, table, ref_row, new_title: str, new_description: str, red_highlight: bool = False, insert_after_row=None):
         """
@@ -1504,11 +1516,12 @@ class TermSheetTransformer:
 
         Retourne None si la section est introuvable.
 
+        Pour les tableaux à deux colonnes sans fusion verticale : les lignes suivantes dont la
+        colonne titre est vide sont concaténées (textes des cellules B reliés par des sauts de ligne).
+
         Exemple :
             issuer = transformer.get_section_description("Issuer")
-            # issuer == "BNP"
             transformer.set_section("Issuer", issuer + " bank")
-            # => "BNP bank"
         """
         doc = Document(str(self.docx_path))
         editor = _TermSheetEditor(doc, markup_mode=False)
