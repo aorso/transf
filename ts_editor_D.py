@@ -527,81 +527,140 @@ class _TermSheetEditor:
                 self._create_minimal_row_after(table, format_row, title, description, red_highlight, insert_after_row=last_row)
         return self
 
-    def _is_section_table(self, table) -> bool:
+    def _is_two_col_table(self, table) -> bool:
         """
-        Retourne True si le tableau est un tableau titre/description à 2 colonnes.
+        Détecte si un tableau est un tableau "titre/description" à 2 colonnes.
 
-        Critère : plus de la moitié des lignes directes ont exactement 2 cellules
-        (<w:tc>). Cela exclut les tableaux dont certaines lignes ont 3+ colonnes
-        (tableaux de données standalone à 5+ colonnes) qui ne doivent jamais être
-        traités comme des tableaux de sections.
+        Critère : la majorité stricte des lignes du tableau ont exactement 2 cellules
+        XML `<w:tc>`. Cela permet d'identifier les tableaux de description externes
+        (5+ colonnes) qui ne doivent jamais être confondus avec le tableau principal
+        de sections titre/description.
         """
         if not table.rows:
             return False
-        two_col = sum(
+        two_col_count = sum(
             1 for row in table.rows
             if len(row._tr.findall(qn("w:tc"))) == 2
         )
-        return two_col > len(table.rows) / 2
+        return two_col_count > len(table.rows) / 2
 
     def _find_main_table(self):
         """
-        Retourne le tableau principal titre/description du document.
+        Retourne le tableau principal du document :
+        le tableau "2-colonnes" titre/description ayant le plus grand nombre de lignes.
 
-        Parmi les tableaux qualifiés par _is_section_table, retourne celui
-        qui a le plus grand nombre de lignes. Les tableaux à colonnes multiples
-        (descriptions externes standalone) sont exclus.
+        Les tableaux à >2 colonnes (descriptions externes standalone) sont exclus.
+        Repli sur doc.tables[0] si aucun tableau 2-col n'est trouvé.
         """
         best = None
         best_rows = -1
         for table in self.doc.tables:
-            if self._is_section_table(table) and len(table.rows) > best_rows:
+            if self._is_two_col_table(table) and len(table.rows) > best_rows:
                 best = table
                 best_rows = len(table.rows)
         return best if best is not None else (self.doc.tables[0] if self.doc.tables else None)
 
     def set_section_order(self, section_order: List[str]):
         """
-        Réorganise les lignes du tableau principal selon l'ordre demandé.
-        Contraintes:
-        - La première ligne du tableau reste fixe quoi qu'il arrive.
-        - Les titres absents du document sont ignorés (aucune création).
-        - Les lignes non listées sont conservées à la fin (ordre relatif inchangé).
-        - Les lignes sont déplacées telles quelles (style/format inchangés).
+        Réorganise les sections du tableau principal selon l'ordre demandé.
+
+        Principe :
+        - Une "section" est un bloc = la ligne titre + ses éventuelles lignes de
+          continuation (colonne A vide juste après). Le bloc se déplace comme une unité.
+        - Les blocs dont le titre n'est PAS dans section_order sont des "ancres" :
+          ils restent exactement à leur position d'origine. Ils ne sont jamais poussés
+          à la fin ni déplacés. Cela préserve les en-têtes fusionnés, séparateurs, etc.
+        - Seuls les blocs listés dans section_order sont réordonnés, en occupant les
+          "slots" laissés par leurs positions d'origine.
+        - La première ligne du tableau reste toujours fixe.
+        - Les lignes non listées conservent leur ordre relatif d'origine.
         """
         if not self.doc.tables:
             return self
 
         table = self._find_main_table()
-        if not table.rows:
+        if table is None or not table.rows:
             return self
 
-        fixed_first_row = table.rows[0]
-        movable_rows = list(table.rows[1:])
-        if not movable_rows:
+        all_rows = list(table.rows)
+        if len(all_rows) <= 1:
             return self
 
-        # Même normalisation que celle utilisée pour lire les titres du document.
-        order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
-        default_rank = len(order_map)
+        order_map = {self._normalize(title): rank
+                     for rank, title in enumerate(section_order)}
 
-        # Tri stable: d'abord ordre demandé, puis position d'origine.
-        ranked_rows = []
-        for original_pos, row in enumerate(movable_rows):
-            first_cell_text = row.cells[0].text if len(row.cells) >= 1 else ""
-            row_title = self._normalize(first_cell_text)
-            rank = order_map.get(row_title, default_rank)
-            ranked_rows.append((rank, original_pos, row))
+        # --- 1. Grouper les lignes en blocs ---
+        # Un bloc commence à chaque ligne avec un titre non vide (ou à la première
+        # ligne movable). Les lignes à A vide suivantes sont des continuations.
+        blocks = []       # liste de dicts {rows, title, is_named, rank, orig_idx}
+        current_block = None
 
-        ranked_rows.sort(key=lambda x: (x[0], x[1]))
+        for i, row in enumerate(all_rows):
+            if i == 0:
+                continue  # première ligne toujours fixe
 
-        # Déplacement XML des mêmes <w:tr> => style et structure conservés.
+            title = self._normalize(row.cells[0].text if row.cells else "")
+
+            if title:
+                # Nouvelle section : fermer le bloc précédent et en ouvrir un nouveau
+                if current_block is not None:
+                    blocks.append(current_block)
+                current_block = {
+                    "rows": [row],
+                    "title": title,
+                    "is_named": title in order_map,
+                    "rank": order_map.get(title, len(order_map)),
+                    "orig_idx": len(blocks),
+                }
+            else:
+                # Ligne de continuation (A vide)
+                if current_block is None:
+                    # Avant tout titre : on crée un bloc ancre orphelin
+                    current_block = {
+                        "rows": [row],
+                        "title": "",
+                        "is_named": False,
+                        "rank": len(order_map),
+                        "orig_idx": len(blocks),
+                    }
+                else:
+                    current_block["rows"].append(row)
+
+        if current_block is not None:
+            blocks.append(current_block)
+
+        if not blocks or not any(b["is_named"] for b in blocks):
+            return self
+
+        # --- 2. Séparer slots et blocs nommés ---
+        # Les "slots" sont les positions (dans blocks[]) occupées par des blocs nommés.
+        named_slot_indices = [i for i, b in enumerate(blocks) if b["is_named"]]
+        named_blocks_sorted = sorted(
+            [b for b in blocks if b["is_named"]],
+            key=lambda b: (b["rank"], b["orig_idx"])
+        )
+
+        # --- 3. Construire la nouvelle séquence de blocs ---
+        new_blocks = list(blocks)
+        for slot_i, sorted_block in zip(named_slot_indices, named_blocks_sorted):
+            new_blocks[slot_i] = sorted_block
+
+        # --- 4. Vérifier si quelque chose a changé ---
+        new_rows_flat = [all_rows[0]]
+        for b in new_blocks:
+            new_rows_flat.extend(b["rows"])
+
+        if all(new_rows_flat[i] is all_rows[i] for i in range(len(all_rows))):
+            return self  # aucun changement, rien à faire
+
+        # --- 5. Appliquer le réordonnancement XML ---
         tbl = table._tbl
-        for row in movable_rows:
+        # Retirer toutes les lignes mobiles du tableau
+        for row in all_rows[1:]:
             tbl.remove(row._tr)
-
-        cursor_tr = fixed_first_row._tr
-        for _, _, row in ranked_rows:
+        # Réinsérer dans le nouvel ordre
+        cursor_tr = all_rows[0]._tr
+        for row in new_rows_flat[1:]:
             cursor_tr.addnext(row._tr)
             cursor_tr = row._tr
 
@@ -803,14 +862,16 @@ class _TermSheetEditor:
 
     def _find_section_row(self, section_title: str, occurrence: int = 1):
         """
-        Cherche une ligne de section uniquement dans les tableaux titre/description
-        qualifiés par _is_section_table. Les tableaux à colonnes multiples (5-col,
-        etc.) sont entièrement ignorés.
+        Cherche une ligne de section dans les tableaux 2-colonnes uniquement.
+
+        Les tableaux à >2 colonnes (descriptions externes) sont entièrement ignorés
+        pour éviter qu'un titre de section corresponde par erreur au contenu d'une
+        cellule de tableau 5-colonnes.
         """
         target = self._normalize(section_title)
         count = 0
         for table in self.doc.tables:
-            if not self._is_section_table(table):
+            if not self._is_two_col_table(table):
                 continue
             row = self._find_section_row_in_table(table, target, occurrence, count)
             if row is not None:
@@ -819,7 +880,8 @@ class _TermSheetEditor:
         return None, None
 
     def _count_occurrences_in_table(self, table, target: str) -> int:
-        if not self._is_section_table(table):
+        """Compte les occurrences du titre, en restant dans les tableaux 2-col."""
+        if not self._is_two_col_table(table):
             return 0
         c = 0
         for row in table.rows:
@@ -831,7 +893,8 @@ class _TermSheetEditor:
         return c
 
     def _find_section_row_in_table(self, table, target: str, occurrence: int, count_so_far: int = 0):
-        if not self._is_section_table(table):
+        """Cherche la n-ième ligne au titre demandé, en restant dans les tableaux 2-col."""
+        if not self._is_two_col_table(table):
             return None
         count = count_so_far
         for row in table.rows:
