@@ -509,8 +509,15 @@ class _TermSheetEditor:
         """
         Réorganise les sections selon l'ordre demandé.
 
-        Gère les sections avec tableaux de description externe (standalone dans le body) :
-        le tableau externe suit toujours sa section, même après réordonnancement.
+        Principe : chaque segment de tableau 2-col est trié indépendamment.
+        Aucune ligne n'est déplacée d'un tableau à un autre (pas de fusion/recréation
+        de tableaux, ce qui préserve parfaitement les largeurs de colonnes et la
+        mise en forme).
+
+        Gestion des tableaux externes : si, après tri, la section qui "possède" un
+        tableau externe (standalone dans le body) n'est plus la dernière ligne de
+        son segment, le segment est coupé en deux à cet endroit via deepcopy afin
+        que le tableau externe reste visuellement attaché à sa section.
 
         Contraintes :
         - La première ligne du premier tableau 2-col reste fixe.
@@ -520,79 +527,60 @@ class _TermSheetEditor:
         if not self.doc.tables:
             return self
 
-        body = self.doc.element.body
-
-        # --- 1. Collecter tous les tableaux 2-col et leurs éléments externes ---
         two_col_data = self._get_body_two_col_tables()
 
-        # Fallback : comportement original si aucun tableau 2-col trouvé au niveau body
         if not two_col_data:
             table = self._find_main_table()
-            if not table or not table.rows:
-                return self
-            return self._sort_rows_in_table(table, section_order)
-
-        first_tbl_obj = two_col_data[0][0]
-        if not first_tbl_obj.rows:
-            return self
-        fixed_first_row = first_tbl_obj.rows[0]
-
-        # --- 2. Collecter toutes les lignes mobiles (tous tableaux 2-col confondus) ---
-        all_rows = []
-        row_to_ext_group = {}  # id(row._tr) → ext_group (pour la dernière ligne de chaque tbl)
-
-        for i, (tbl_obj, ext_group) in enumerate(two_col_data):
-            start = 1 if i == 0 else 0
-            rows = list(tbl_obj.rows)[start:]
-            all_rows.extend(rows)
-            if ext_group and tbl_obj.rows:
-                row_to_ext_group[id(tbl_obj.rows[-1]._tr)] = ext_group
-
-        if not all_rows:
+            if table:
+                self._sort_rows_in_table(table, section_order)
             return self
 
-        # --- 3. Trier ---
         order_map = {self._normalize(title): idx for idx, title in enumerate(section_order)}
         default_rank = len(order_map)
 
-        ranked = []
-        for orig_pos, row in enumerate(all_rows):
-            title_text = row.cells[0].text if row.cells else ""
-            rank = order_map.get(self._normalize(title_text), default_rank)
-            ranked.append((rank, orig_pos, row))
-
-        ranked.sort(key=lambda x: (x[0], x[1]))
-        sorted_rows = [row for _, _, row in ranked]
-
-        # --- 4. Retirer du body tous les ext_groups et les tableaux 2-col non-premiers ---
         for i, (tbl_obj, ext_group) in enumerate(two_col_data):
-            if i > 0:
-                body.remove(tbl_obj._tbl)
-            for elem in ext_group:
-                if elem.getparent() is body:
-                    body.remove(elem)
+            if not tbl_obj.rows:
+                continue
 
-        # --- 5. Fusionner toutes les lignes dans le premier tableau ---
-        first_tbl = first_tbl_obj._tbl
-        for row in list(first_tbl_obj.rows)[1:]:
-            first_tbl.remove(row._tr)
+            # Identifier si ce tableau possède un tableau externe (non-2col qui suit dans le body)
+            has_ext_tbl = any(e.tag.split('}')[-1] == 'tbl' for e in ext_group)
+            owner_tr = tbl_obj.rows[-1]._tr if has_ext_tbl else None
 
-        cursor_tr = fixed_first_row._tr
-        for row in sorted_rows:
-            cursor_tr.addnext(row._tr)
-            cursor_tr = row._tr
+            # La première ligne du premier tableau est fixe
+            start = 1 if i == 0 else 0
+            movable_rows = list(tbl_obj.rows)[start:]
+            if not movable_rows:
+                continue
 
-        # --- 6. Re-couper le tableau fusionné aux frontières des tableaux externes ---
-        # Traité de la dernière à la première pour ne pas perturber les indices
-        ext_rows = [
-            (idx, row, row_to_ext_group[id(row._tr)])
-            for idx, row in enumerate(sorted_rows)
-            if id(row._tr) in row_to_ext_group
-        ]
+            # Calculer les rangs
+            ranked_rows = []
+            for orig_pos, row in enumerate(movable_rows):
+                title_text = row.cells[0].text if row.cells else ""
+                rank = order_map.get(self._normalize(title_text), default_rank)
+                ranked_rows.append((rank, orig_pos, row))
+            ranked_rows.sort(key=lambda x: (x[0], x[1]))
 
-        for _idx, row, ext_group in reversed(ext_rows):
-            # La ligne peut désormais être dans first_tbl ou dans un tableau de continuation
-            self._split_table_after_row(row._tr, ext_group)
+            # Retirer puis réinsérer dans l'ordre trié
+            tbl = tbl_obj._tbl
+            for row in movable_rows:
+                tbl.remove(row._tr)
+
+            if start > 0:
+                # Premier tableau : insérer après la ligne fixe
+                cursor_tr = tbl_obj.rows[0]._tr
+                for _, _, row in ranked_rows:
+                    cursor_tr.addnext(row._tr)
+                    cursor_tr = row._tr
+            else:
+                # Tableaux suivants : pas de ligne fixe, simple append dans l'ordre
+                for _, _, row in ranked_rows:
+                    tbl.append(row._tr)
+
+            # Si l'owner du tableau externe n'est plus la dernière ligne, couper le tableau
+            if owner_tr is not None:
+                current_rows = list(tbl_obj.rows)
+                if current_rows and current_rows[-1]._tr is not owner_tr:
+                    self._split_table_after_row(owner_tr, ext_group)
 
         return self
 
@@ -981,11 +969,15 @@ class _TermSheetEditor:
     def _split_table_after_row(self, tr_elem, ext_group):
         """
         Coupe le tableau contenant tr_elem après cette ligne.
-        Insère ext_group dans le body juste après, puis crée un tableau
-        de continuation avec les lignes suivantes (en copiant tblPr/tblGrid).
+
+        Le tableau de continuation est créé par deepcopy du tableau original
+        (préserve intégralement tblPr, tblGrid, largeurs de colonnes, bordures, etc.)
+        puis les lignes qui suivent le point de coupure y sont déplacées.
+
+        Les éléments ext_group sont repositionnés entre le tableau original (tronqué)
+        et le tableau de continuation via addnext (déplacement dans le body XML).
         """
         tbl_elem = tr_elem.getparent()
-        body = tbl_elem.getparent()
 
         all_trs = [e for e in tbl_elem if e.tag.split('}')[-1] == 'tr']
         tr_idx = next((i for i, tr in enumerate(all_trs) if tr is tr_elem), None)
@@ -994,21 +986,19 @@ class _TermSheetEditor:
 
         trs_after = all_trs[tr_idx + 1:]
 
-        # Insérer ext_group juste après tbl_elem
+        # Repositionner ext_group juste après tbl_elem (addnext déplace l'élément dans le body)
         insert_point = tbl_elem
         for ext_elem in ext_group:
             insert_point.addnext(ext_elem)
             insert_point = ext_elem
 
         if trs_after:
-            # Créer un tableau de continuation avec tblPr + tblGrid du tableau original
-            new_tbl = OxmlElement('w:tbl')
-            tbl_pr = tbl_elem.find(qn('w:tblPr'))
-            if tbl_pr is not None:
-                new_tbl.append(deepcopy(tbl_pr))
-            tbl_grid = tbl_elem.find(qn('w:tblGrid'))
-            if tbl_grid is not None:
-                new_tbl.append(deepcopy(tbl_grid))
+            # Tableau de continuation = deepcopy exact du tableau d'origine (structure complète)
+            new_tbl = deepcopy(tbl_elem)
+            # Vider le deepcopy de ses lignes (on y mettra les lignes originales)
+            for tr in list(new_tbl.findall(qn('w:tr'))):
+                new_tbl.remove(tr)
+            # Déplacer les lignes qui suivent le point de coupure vers le nouveau tableau
             for tr in trs_after:
                 tbl_elem.remove(tr)
                 new_tbl.append(tr)
