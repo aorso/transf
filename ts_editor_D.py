@@ -531,18 +531,25 @@ class _TermSheetEditor:
         """
         Détecte si un tableau est un tableau "titre/description" à 2 colonnes.
 
-        Critère : la majorité stricte des lignes du tableau ont exactement 2 cellules
-        XML `<w:tc>`. Cela permet d'identifier les tableaux de description externes
-        (5+ colonnes) qui ne doivent jamais être confondus avec le tableau principal
-        de sections titre/description.
+        Critère strict :
+        - Au moins une ligne a exactement 2 cellules `<w:tc>`.
+        - Aucune ligne n'a plus de 2 cellules `<w:tc>`.
+
+        La seconde condition est l'essentielle : dès qu'une seule ligne a 3 cellules
+        ou plus (comme dans un tableau 5-colonnes), le tableau est immédiatement
+        exclu. Cela résiste aux tableaux de description externe qui ont des lignes
+        d'en-tête fusionnées (2 tc) mais aussi des lignes de données (5 tc).
         """
         if not table.rows:
             return False
-        two_col_count = sum(
-            1 for row in table.rows
-            if len(row._tr.findall(qn("w:tc"))) == 2
-        )
-        return two_col_count > len(table.rows) / 2
+        has_two_col_row = False
+        for row in table.rows:
+            tc_count = len(row._tr.findall(qn("w:tc")))
+            if tc_count > 2:
+                return False        # une seule ligne ≥3 cols suffit à exclure le tableau
+            if tc_count == 2:
+                has_two_col_row = True
+        return has_two_col_row
 
     def _find_main_table(self):
         """
