@@ -331,7 +331,11 @@ class _TermSheetEditor:
     def _section_block_rows(self, table, title_row):
         """
         Lignes consécutives d'une même section lorsque la colonne titre (A) n'est pas fusionnée :
-        première ligne = titre en A ; lignes suivantes avec A vide = suite de la description (texte en B).
+        première ligne = titre en A ; lignes suivantes (à 2 tc) avec A vide = suite de la description.
+
+        On stoppe sur :
+        - une ligne fusionnée (1 tc) qui marque toujours une rupture de section (en-tête),
+        - une ligne dont la colonne A contient du texte (nouveau titre).
         """
         rows_list = table.rows
         start_idx = None
@@ -347,6 +351,8 @@ class _TermSheetEditor:
             if j == start_idx:
                 block.append(r)
                 continue
+            if self._real_tc_count(r) != 2:
+                break
             first = r.cells[0].text if len(r.cells) >= 1 else ""
             if self._normalize(first):
                 break
@@ -356,40 +362,48 @@ class _TermSheetEditor:
     def _aggregate_description_from_block(self, block_rows) -> str:
         parts = []
         for r in block_rows:
-            if len(r.cells) >= 2:
+            if self._real_tc_count(r) == 2:
                 parts.append(r.cells[1].text)
         return "\n".join(parts).strip()
 
     def _apply_description_to_block(
         self, block_rows, description: str, highlight: bool, red_highlight: bool
     ):
-        """Écrit toute la description dans la première cellule B du bloc et vide les B suivantes."""
+        """Écrit toute la description dans la première cellule B du bloc et vide les B suivantes.
+
+        N'écrit dans `cells[1]` que si la ligne a 2 `<w:tc>` réels (titre et
+        description physiquement distincts). Pour une ligne fusionnée (1 tc,
+        gridSpan=2), `cells[0]` et `cells[1]` pointent vers la même cellule
+        physique : écrire dans `cells[1]` écraserait le titre. On saute donc
+        ces lignes.
+        """
         if not block_rows:
             return
         first_desc = True
         for r in block_rows:
-            if len(r.cells) >= 2:
-                if first_desc:
-                    self._set_cell_text(
-                        r.cells[1],
-                        description,
-                        highlight=highlight,
-                        red_highlight=red_highlight,
-                    )
-                    first_desc = False
-                else:
-                    self._set_cell_text(r.cells[1], "", highlight=False, red_highlight=False)
+            if self._real_tc_count(r) != 2:
+                continue
+            if first_desc:
+                self._set_cell_text(
+                    r.cells[1],
+                    description,
+                    highlight=highlight,
+                    red_highlight=red_highlight,
+                )
+                first_desc = False
+            else:
+                self._set_cell_text(r.cells[1], "", highlight=False, red_highlight=False)
 
     def update_section_description(self, section_title: str, new_description: str, occurrence: int = 1):
         row, table = self._find_section_row(section_title, occurrence)
         if row is None:
             return self
-        if len(row.cells) >= 2:
+        if self._real_tc_count(row) == 2:
             block = self._section_block_rows(table, row)
             self._apply_description_to_block(
                 block, new_description, highlight=self.markup_mode, red_highlight=False
             )
-        elif len(row.cells) == 1:
+        else:
             title = self._normalize(row.cells[0].text)
             self._set_cell_text(row.cells[0], f"{title}: {new_description}", highlight=self.markup_mode)
         return self
@@ -398,7 +412,7 @@ class _TermSheetEditor:
         row, table = self._find_section_row(section_title, occurrence)
         if row is None:
             return self
-        if len(row.cells) >= 2:
+        if self._real_tc_count(row) == 2:
             block = self._section_block_rows(table, row)
         else:
             block = [row]
@@ -429,13 +443,12 @@ class _TermSheetEditor:
         row, table = self._find_section_row(section_title, occurrence)
         if row is None:
             return None
-        if len(row.cells) >= 2:
+        if self._real_tc_count(row) == 2:
             block = self._section_block_rows(table, row)
             return self._aggregate_description_from_block(block)
-        if len(row.cells) == 1:
-            text = row.cells[0].text
-            if ":" in text:
-                return text.split(":", 1)[1].strip()
+        text = row.cells[0].text if len(row.cells) >= 1 else ""
+        if ":" in text:
+            return text.split(":", 1)[1].strip()
         return None
 
     def insert_section_after(self, after_section: str, new_title: str, new_description: str, occurrence: int = 1):
@@ -444,7 +457,7 @@ class _TermSheetEditor:
             raise ValueError(f"Section de référence introuvable : {after_section}")
         anchor = (
             self._section_block_rows(table, ref_row)[-1]
-            if len(ref_row.cells) >= 2
+            if self._real_tc_count(ref_row) == 2
             else ref_row
         )
         self._create_minimal_row_after(
@@ -469,10 +482,10 @@ class _TermSheetEditor:
           la dernière ligne de ce bloc.
         """
         row, table = self._find_section_row(title, occurrence)
-        
+
         if row is not None:
-            # Section existe : mise à jour de la description
-            if len(row.cells) >= 2:
+            tc_count = self._real_tc_count(row)
+            if tc_count == 2:
                 block = self._section_block_rows(table, row)
                 self._apply_description_to_block(
                     block,
@@ -480,91 +493,117 @@ class _TermSheetEditor:
                     highlight=self.markup_mode,
                     red_highlight=red_highlight and not self.markup_mode,
                 )
-            elif len(row.cells) == 1:
+            else:
+                # Ligne fusionnée (1 tc) : on conserve le titre et on l'enrichit
+                # via "Titre: description". On NE touche jamais cells[1] ici car
+                # ce serait la même cellule physique que cells[0].
                 norm_title = self._normalize(row.cells[0].text)
                 self._set_cell_text(
-                    row.cells[0], 
+                    row.cells[0],
                     f"{norm_title}: {description}",
                     highlight=self.markup_mode,
-                    red_highlight=red_highlight and not self.markup_mode
+                    red_highlight=red_highlight and not self.markup_mode,
                 )
         else:
-            # Section n'existe pas : ajout
+            # Section inexistante : on l'ajoute toujours dans le tableau principal
+            # 2-col, jamais dans un tableau externe.
+            if not self.doc.tables:
+                raise ValueError("Aucun tableau trouvé dans le document")
+            table = self._find_main_table()
+            if table is None or not table.rows:
+                raise ValueError("Aucun tableau 2-colonnes trouvé pour l'insertion")
+            format_row = self._find_reference_row_for_format(table)
+            if format_row is None:
+                raise ValueError("Impossible de trouver une ligne de référence valide dans le tableau")
+
             if after_section:
-                # Ajouter après une section spécifique
-                ref_row, table = self._find_section_row(after_section, occurrence)
+                ref_row, ref_table = self._find_section_row(after_section, occurrence)
                 if ref_row is None:
                     raise ValueError(f"Section de référence introuvable : {after_section}")
-                # Utiliser une ligne de référence "standard" pour le style
-                # et insérer à l'endroit demandé (après ref_row).
-                format_row = self._find_reference_row_for_format(table) or ref_row
-                anchor = (
-                    self._section_block_rows(table, ref_row)[-1]
-                    if len(ref_row.cells) >= 2
-                    else ref_row
-                )
-                self._create_minimal_row_after(
-                    table,
-                    format_row,
-                    title,
-                    description,
-                    red_highlight,
-                    insert_after_row=anchor,
-                )
+                # On exige que la section de référence soit dans le tableau principal,
+                # sinon on insère à la fin du tableau principal.
+                if ref_table is not table:
+                    anchor = table.rows[-1]
+                else:
+                    anchor = (
+                        self._section_block_rows(table, ref_row)[-1]
+                        if self._real_tc_count(ref_row) == 2
+                        else ref_row
+                    )
             else:
-                # Ajouter à la fin du tableau principal
-                if not self.doc.tables:
-                    raise ValueError("Aucun tableau trouvé dans le document")
-                table = self._find_main_table()
-                if not table.rows:
-                    raise ValueError("Le tableau est vide")
-                # Trouver une ligne de référence avec le bon format (Currency/Trade Date)
-                format_row = self._find_reference_row_for_format(table)
-                if format_row is None:
-                    raise ValueError("Impossible de trouver une ligne de référence valide dans le tableau")
-                # Insérer après la dernière ligne
-                last_row = table.rows[-1]
-                self._create_minimal_row_after(table, format_row, title, description, red_highlight, insert_after_row=last_row)
+                anchor = table.rows[-1]
+
+            self._create_minimal_row_after(
+                table,
+                format_row,
+                title,
+                description,
+                red_highlight,
+                insert_after_row=anchor,
+            )
         return self
+
+    def _real_tc_count(self, row) -> int:
+        """Nombre RÉEL de cellules physiques `<w:tc>` dans la ligne XML.
+
+        Différent de `len(row.cells)` qui déplie les `gridSpan` et renvoie
+        autant d'entrées que de colonnes logiques (potentiellement plusieurs
+        entrées pointant vers la même cellule physique).
+        """
+        return len(row._tr.findall(qn("w:tc")))
+
+    def _grid_col_count(self, table) -> int:
+        """Nombre de colonnes canoniques du tableau d'après `<w:tblGrid>`."""
+        tbl = table._tbl
+        grid = tbl.find(qn("w:tblGrid"))
+        if grid is None:
+            return 0
+        return len(grid.findall(qn("w:gridCol")))
 
     def _is_two_col_table(self, table) -> bool:
         """
         Détecte si un tableau est un tableau "titre/description" à 2 colonnes.
 
-        Critère strict :
-        - Au moins une ligne a exactement 2 cellules `<w:tc>`.
-        - Aucune ligne n'a plus de 2 cellules `<w:tc>`.
-
-        La seconde condition est l'essentielle : dès qu'une seule ligne a 3 cellules
-        ou plus (comme dans un tableau 5-colonnes), le tableau est immédiatement
-        exclu. Cela résiste aux tableaux de description externe qui ont des lignes
-        d'en-tête fusionnées (2 tc) mais aussi des lignes de données (5 tc).
+        Critère strict combinant plusieurs garde-fous :
+        - `<w:tblGrid>` doit avoir au plus 2 colonnes canoniques (un tableau
+          5-col à `tblGrid` 5 est immédiatement exclu, même si ses lignes ont
+          été fusionnées en 2 tc visibles).
+        - Aucune ligne ne doit avoir plus de 2 `<w:tc>`.
+        - Au moins une ligne doit avoir exactement 2 `<w:tc>` (lignes
+          titre/description).
         """
         if not table.rows:
             return False
-        has_two_col_row = False
+        grid_cols = self._grid_col_count(table)
+        if grid_cols > 2:
+            return False
+        has_two_tc_row = False
         for row in table.rows:
-            tc_count = len(row._tr.findall(qn("w:tc")))
+            tc_count = self._real_tc_count(row)
             if tc_count > 2:
-                return False        # une seule ligne ≥3 cols suffit à exclure le tableau
+                return False
             if tc_count == 2:
-                has_two_col_row = True
-        return has_two_col_row
+                has_two_tc_row = True
+        return has_two_tc_row
 
     def _find_main_table(self):
         """
         Retourne le tableau principal du document :
-        le tableau "2-colonnes" titre/description ayant le plus grand nombre de lignes.
+        le tableau "2-colonnes" titre/description ayant le plus grand nombre
+        de lignes à 2 `<w:tc>` réels (vraies lignes titre/description).
 
-        Les tableaux à >2 colonnes (descriptions externes standalone) sont exclus.
-        Repli sur doc.tables[0] si aucun tableau 2-col n'est trouvé.
+        Les tableaux dont `<w:tblGrid>` a >2 colonnes ou dont une ligne a >2 tc
+        sont exclus. Repli sur doc.tables[0] si aucun candidat n'est trouvé.
         """
         best = None
-        best_rows = -1
+        best_score = -1
         for table in self.doc.tables:
-            if self._is_two_col_table(table) and len(table.rows) > best_rows:
+            if not self._is_two_col_table(table):
+                continue
+            score = sum(1 for r in table.rows if self._real_tc_count(r) == 2)
+            if score > best_score:
                 best = table
-                best_rows = len(table.rows)
+                best_score = score
         return best if best is not None else (self.doc.tables[0] if self.doc.tables else None)
 
     def set_section_order(self, section_order: List[str]):
@@ -843,29 +882,26 @@ class _TermSheetEditor:
 
     def _find_reference_row_for_format(self, table):
         """
-        Trouve une ligne de référence avec le bon format (2 colonnes) pour cloner.
-        Priorité : "Currency" > "Trade Date" > n'importe quelle ligne avec 2+ colonnes > dernière ligne
+        Trouve une ligne de référence avec le bon format (exactement 2 cellules
+        physiques) pour cloner. Les lignes fusionnées (1 tc, gridSpan=2) sont
+        exclues.
+        Priorité : "Currency" > "Trade Date" > première ligne 2-tc trouvée.
         """
-        # Liste des titres à chercher dans l'ordre de priorité
         reference_titles = ["currency", "trade date"]
-        
+
         def norm(s: str) -> str:
             return self._normalize(s).casefold()
-        
+
         for title_to_search in reference_titles:
             for row in table.rows:
-                tcs = row._tr.findall(qn("w:tc"))
-                if len(tcs) >= 2 and norm(row.cells[0].text) == title_to_search:
+                if self._real_tc_count(row) == 2 and norm(row.cells[0].text) == title_to_search:
                     return row
-        
-        # Fallback : chercher n'importe quelle ligne "simple" à 2 cellules réelles
+
         for row in table.rows:
-            tcs = row._tr.findall(qn("w:tc"))
-            if len(tcs) >= 2:
+            if self._real_tc_count(row) == 2:
                 return row
-        
-        # Dernier fallback : la dernière ligne
-        return table.rows[-1] if table.rows else None
+
+        return None
 
     def _find_section_row(self, section_title: str, occurrence: int = 1):
         """
@@ -887,12 +923,21 @@ class _TermSheetEditor:
         return None, None
 
     def _count_occurrences_in_table(self, table, target: str) -> int:
-        """Compte les occurrences du titre, en restant dans les tableaux 2-col."""
+        """Compte les occurrences du titre, en restant dans les tableaux 2-col.
+
+        Ne compte QUE les lignes qui ont 2 `<w:tc>` réels (titre + description
+        physiquement distincts). Les lignes fusionnées (1 tc, gridSpan=2)
+        servant d'en-tête sont ignorées.
+        """
         if not self._is_two_col_table(table):
             return 0
         c = 0
         for row in table.rows:
-            if len(row.cells) >= 1 and self._normalize(row.cells[0].text) == target:
+            if (
+                self._real_tc_count(row) == 2
+                and len(row.cells) >= 1
+                and self._normalize(row.cells[0].text) == target
+            ):
                 c += 1
             for cell in row.cells:
                 for nested in cell.tables:
@@ -900,12 +945,22 @@ class _TermSheetEditor:
         return c
 
     def _find_section_row_in_table(self, table, target: str, occurrence: int, count_so_far: int = 0):
-        """Cherche la n-ième ligne au titre demandé, en restant dans les tableaux 2-col."""
+        """Cherche la n-ième ligne au titre demandé, en restant dans les tableaux 2-col.
+
+        Ne matche QUE les lignes à 2 `<w:tc>` réels, pour éviter de viser une
+        ligne d'en-tête fusionnée (où cells[0] et cells[1] désignent la même
+        cellule physique, ce qui provoquerait l'écrasement du titre par la
+        description).
+        """
         if not self._is_two_col_table(table):
             return None
         count = count_so_far
         for row in table.rows:
-            if len(row.cells) >= 1 and self._normalize(row.cells[0].text) == target:
+            if (
+                self._real_tc_count(row) == 2
+                and len(row.cells) >= 1
+                and self._normalize(row.cells[0].text) == target
+            ):
                 count += 1
                 if count == occurrence:
                     return row
@@ -948,27 +1003,27 @@ class _TermSheetEditor:
         if new_row is None:
             return self
 
-        if len(new_row.cells) >= 2:
-            # Colonne titre
+        if self._real_tc_count(new_row) == 2:
             self._set_cell_text(
                 new_row.cells[0],
                 new_title,
                 highlight=self.markup_mode,
-                red_highlight=False
+                red_highlight=False,
             )
-            # Colonne description
             self._set_cell_text(
                 new_row.cells[1],
                 new_description,
                 highlight=self.markup_mode,
-                red_highlight=red_highlight and not self.markup_mode
+                red_highlight=red_highlight and not self.markup_mode,
             )
-        elif len(new_row.cells) == 1:
+        else:
+            # Ligne clonée à 1 tc (fusionnée) : on encode "Titre: description"
+            # dans l'unique cellule physique pour éviter d'écraser le titre.
             self._set_cell_text(
                 new_row.cells[0],
                 f"{new_title}: {new_description}",
                 highlight=self.markup_mode,
-                red_highlight=red_highlight and not self.markup_mode
+                red_highlight=red_highlight and not self.markup_mode,
             )
 
         # Pas besoin de retourner la nouvelle ligne
