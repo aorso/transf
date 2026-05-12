@@ -404,8 +404,12 @@ class _TermSheetEditor:
                 block, new_description, highlight=self.markup_mode, red_highlight=False
             )
         else:
-            title = self._normalize(row.cells[0].text)
-            self._set_cell_text(row.cells[0], f"{title}: {new_description}", highlight=self.markup_mode)
+            title_part, sep = self._extract_1tc_title_and_sep(row.cells[0].text)
+            self._set_cell_text(
+                row.cells[0],
+                f"{title_part}{sep}{new_description}",
+                highlight=self.markup_mode,
+            )
         return self
 
     def delete_section(self, section_title: str, occurrence: int = 1):
@@ -494,13 +498,13 @@ class _TermSheetEditor:
                     red_highlight=red_highlight and not self.markup_mode,
                 )
             else:
-                # Ligne fusionnée (1 tc) : on conserve le titre et on l'enrichit
-                # via "Titre: description". On NE touche jamais cells[1] ici car
+                # Ligne fusionnée (1 tc) : on remplace l'ancienne description en
+                # conservant le titre original. On NE touche jamais cells[1] ici car
                 # ce serait la même cellule physique que cells[0].
-                norm_title = self._normalize(row.cells[0].text)
+                title_part, sep = self._extract_1tc_title_and_sep(row.cells[0].text)
                 self._set_cell_text(
                     row.cells[0],
-                    f"{norm_title}: {description}",
+                    f"{title_part}{sep}{description}",
                     highlight=self.markup_mode,
                     red_highlight=red_highlight and not self.markup_mode,
                 )
@@ -551,6 +555,45 @@ class _TermSheetEditor:
         entrées pointant vers la même cellule physique).
         """
         return len(row._tr.findall(qn("w:tc")))
+
+    def _row_title_matches(self, row, target: str) -> bool:
+        """Indique si la ligne porte le titre `target`.
+
+        - 2 tc : `cells[0].text` doit valoir exactement `target`.
+        - 1 tc : `cells[0].text` doit valoir `target`, ou commencer par
+          `target + ":"` / `target + " :"` (format "Titre : description" dans
+          la même cellule pour les sections fusionnées).
+        """
+        if not row.cells:
+            return False
+        tc = self._real_tc_count(row)
+        cell_text = self._normalize(row.cells[0].text)
+        if tc == 2:
+            return cell_text == target
+        if tc == 1:
+            if cell_text == target:
+                return True
+            return (
+                cell_text.startswith(target + ":")
+                or cell_text.startswith(target + " :")
+            )
+        return False
+
+    def _extract_1tc_title_and_sep(self, cell_text: str) -> Tuple[str, str]:
+        """Pour une cellule 1-tc, extrait (titre, séparateur).
+
+        Renvoie le titre nu (avant `:`) et le séparateur utilisé (`" : "` ou
+        `": "`), pour préserver le style original lors d'une mise à jour.
+        """
+        normalized = self._normalize(cell_text)
+        if " :" in normalized:
+            head, _ = normalized.split(":", 1)
+            head = head.rstrip()
+            return head, " : "
+        if ":" in normalized:
+            head, _ = normalized.split(":", 1)
+            return head.rstrip(), ": "
+        return normalized, ": "
 
     def _grid_col_count(self, table) -> int:
         """Nombre de colonnes canoniques du tableau d'après `<w:tblGrid>`."""
@@ -608,107 +651,195 @@ class _TermSheetEditor:
 
     def set_section_order(self, section_order: List[str]):
         """
-        Réorganise les sections du tableau principal selon l'ordre demandé.
+        Réorganise les sections du document selon l'ordre demandé, en gérant
+        les tableaux non-2-col (ex: tableau 5-col de description) attachés à
+        une ligne de titre.
 
         Principe :
-        - Une "section" est un bloc = la ligne titre + ses éventuelles lignes de
-          continuation (colonne A vide juste après). Le bloc se déplace comme une unité.
-        - Les blocs dont le titre n'est PAS dans section_order sont des "ancres" :
-          ils restent exactement à leur position d'origine. Ils ne sont jamais poussés
-          à la fin ni déplacés. Cela préserve les en-têtes fusionnés, séparateurs, etc.
-        - Seuls les blocs listés dans section_order sont réordonnés, en occupant les
-          "slots" laissés par leurs positions d'origine.
-        - La première ligne du tableau reste toujours fixe.
-        - Les lignes non listées conservent leur ordre relatif d'origine.
+        - On considère TOUS les tableaux 2-col du body en ordre.
+        - Chaque ligne d'un tableau 2-col est une "section item".
+        - Les éléments du body qui ne sont PAS des tableaux 2-col (paragraphe
+          ou tableau non-2-col) et qui sont entre le premier et le dernier
+          tableau 2-col sont "attachés" à la section qui les précède.
+        - Un "bloc" = ligne de titre + lignes de continuation (colonne A vide
+          juste après). Tout le bloc se déplace comme une unité, ainsi que ses
+          externals attachés.
+        - Les blocs dont le titre est dans `section_order` sont triés ; les
+          autres restent à leur slot d'origine.
+        - Les éléments AVANT le premier tableau 2-col (pre-header) et ceux
+          APRÈS le dernier (post-footer) restent intouchés.
+        - Si une section déplacée a un tableau 5-col attaché, il la suit dans
+          le body : le tableau 2-col cible est scindé pour insérer le 5-col
+          juste après la ligne propriétaire.
         """
         if not self.doc.tables:
             return self
 
-        table = self._find_main_table()
-        if table is None or not table.rows:
+        body = self.doc.element.body
+        body_children = list(body)
+
+        # 1. Repérer tous les tableaux 2-col top-level
+        two_col_tbl_elements = []
+        two_col_tbl_docs = []
+        for child in body_children:
+            if child.tag != qn("w:tbl"):
+                continue
+            tbl_doc = next(
+                (t for t in self.doc.tables if t._tbl is child), None
+            )
+            if tbl_doc is not None and self._is_two_col_table(tbl_doc):
+                two_col_tbl_elements.append(child)
+                two_col_tbl_docs.append(tbl_doc)
+
+        if not two_col_tbl_docs:
             return self
 
-        all_rows = list(table.rows)
-        if len(all_rows) <= 1:
-            return self
+        first_idx = body_children.index(two_col_tbl_elements[0])
+        last_2col_idx = body_children.index(two_col_tbl_elements[-1])
 
-        order_map = {self._normalize(title): rank
-                     for rank, title in enumerate(section_order)}
+        # On étend la zone managée si des tableaux non-2-col suivent le
+        # dernier tableau 2-col : ils sont attachés à la dernière ligne et
+        # doivent suivre celle-ci lors d'un déplacement.
+        last_managed_idx = last_2col_idx
+        for i in range(last_2col_idx + 1, len(body_children)):
+            if body_children[i].tag == qn("w:tbl"):
+                last_managed_idx = i
 
-        # --- 1. Grouper les lignes en blocs ---
-        # Un bloc commence à chaque ligne avec un titre non vide (ou à la première
-        # ligne movable). Les lignes à A vide suivantes sont des continuations.
-        blocks = []       # liste de dicts {rows, title, is_named, rank, orig_idx}
-        current_block = None
+        pre_header_elements = body_children[:first_idx]
+        managed_elements = body_children[first_idx:last_managed_idx + 1]
+        post_footer_elements = body_children[last_managed_idx + 1:]
 
-        for i, row in enumerate(all_rows):
-            if i == 0:
-                continue  # première ligne toujours fixe
-
-            title = self._normalize(row.cells[0].text if row.cells else "")
-
-            if title:
-                # Nouvelle section : fermer le bloc précédent et en ouvrir un nouveau
-                if current_block is not None:
-                    blocks.append(current_block)
-                current_block = {
-                    "rows": [row],
-                    "title": title,
-                    "is_named": title in order_map,
-                    "rank": order_map.get(title, len(order_map)),
-                    "orig_idx": len(blocks),
-                }
+        # 2. Construire la séquence à plat de "row" / "external" dans la zone managée
+        items = []
+        two_col_set = set(id(e) for e in two_col_tbl_elements)
+        for child in managed_elements:
+            if id(child) in two_col_set:
+                tbl_doc = two_col_tbl_docs[two_col_tbl_elements.index(child)]
+                for row in tbl_doc.rows:
+                    items.append({"type": "row", "row": row, "tr": row._tr})
             else:
-                # Ligne de continuation (A vide)
-                if current_block is None:
-                    # Avant tout titre : on crée un bloc ancre orphelin
-                    current_block = {
-                        "rows": [row],
-                        "title": "",
-                        "is_named": False,
-                        "rank": len(order_map),
-                        "orig_idx": len(blocks),
-                    }
-                else:
-                    current_block["rows"].append(row)
+                items.append({"type": "external", "element": child})
 
-        if current_block is not None:
-            blocks.append(current_block)
+        # 3. Sections : chaque ligne + ses externals juste après
+        sections = []
+        for it in items:
+            if it["type"] == "row":
+                sections.append({"row_item": it, "attached": []})
+            else:
+                if sections:
+                    sections[-1]["attached"].append(it)
 
-        if not blocks or not any(b["is_named"] for b in blocks):
+        if not sections:
             return self
 
-        # --- 2. Séparer slots et blocs nommés ---
-        # Les "slots" sont les positions (dans blocks[]) occupées par des blocs nommés.
+        # 4. Blocs : titre + lignes de continuation (A vide)
+        blocks = []
+        current_block = None
+        for sec in sections:
+            row = sec["row_item"]["row"]
+            tc = self._real_tc_count(row)
+            cell_text = self._normalize(row.cells[0].text if row.cells else "")
+            if tc == 1:
+                clean_title, _ = self._extract_1tc_title_and_sep(row.cells[0].text)
+            else:
+                clean_title = cell_text
+
+            if cell_text:
+                current_block = {"sections": [sec], "clean_title": clean_title}
+                blocks.append(current_block)
+            else:
+                if current_block is None:
+                    current_block = {"sections": [sec], "clean_title": ""}
+                    blocks.append(current_block)
+                else:
+                    current_block["sections"].append(sec)
+
+            # Si cette section a des externals attachés (ex: 5-col après une
+            # ligne titre d'un tableau 2-col), on clôt le bloc courant. La
+            # prochaine section démarrera un nouveau bloc même si sa colonne A
+            # est vide (cas : 2-col table suivante commençant par une ligne de
+            # continuation orpheline).
+            if sec["attached"]:
+                current_block = None
+
+        if not blocks:
+            return self
+
+        # 5. Marquer named vs anchor
+        order_map = {
+            self._normalize(t): rank for rank, t in enumerate(section_order)
+        }
+        for idx, b in enumerate(blocks):
+            b["orig_idx"] = idx
+            b["is_named"] = b["clean_title"] in order_map
+            b["rank"] = order_map.get(b["clean_title"], len(order_map))
+
+        if not any(b["is_named"] for b in blocks):
+            return self
+
+        # 6. Trier les blocs nommés dans leurs slots d'origine
         named_slot_indices = [i for i, b in enumerate(blocks) if b["is_named"]]
         named_blocks_sorted = sorted(
             [b for b in blocks if b["is_named"]],
-            key=lambda b: (b["rank"], b["orig_idx"])
+            key=lambda b: (b["rank"], b["orig_idx"]),
         )
-
-        # --- 3. Construire la nouvelle séquence de blocs ---
         new_blocks = list(blocks)
-        for slot_i, sorted_block in zip(named_slot_indices, named_blocks_sorted):
-            new_blocks[slot_i] = sorted_block
+        for slot_i, sb in zip(named_slot_indices, named_blocks_sorted):
+            new_blocks[slot_i] = sb
 
-        # --- 4. Vérifier si quelque chose a changé ---
-        new_rows_flat = [all_rows[0]]
+        # 7. Reconstruction : on crée de nouveaux tableaux 2-col en clonant
+        #    le template (le premier 2-col du document) et on y replace les
+        #    <w:tr> originaux. Les externals attachés cassent le tableau en
+        #    cours et démarrent un nouveau tableau après.
+        template_tbl = two_col_tbl_elements[0]
+
+        def make_new_2col_tbl():
+            new_tbl = deepcopy(template_tbl)
+            for tr in list(new_tbl.findall(qn("w:tr"))):
+                new_tbl.remove(tr)
+            return new_tbl
+
+        new_body_elements = []
+        current_new_tbl = None
         for b in new_blocks:
-            new_rows_flat.extend(b["rows"])
+            for sec in b["sections"]:
+                tr = sec["row_item"]["tr"]
+                tr_parent = tr.getparent()
+                if tr_parent is not None:
+                    tr_parent.remove(tr)
+                if current_new_tbl is None:
+                    current_new_tbl = make_new_2col_tbl()
+                    new_body_elements.append(current_new_tbl)
+                current_new_tbl.append(tr)
 
-        if all(new_rows_flat[i] is all_rows[i] for i in range(len(all_rows))):
-            return self  # aucun changement, rien à faire
+                for ext_item in sec["attached"]:
+                    ext = ext_item["element"]
+                    ext_parent = ext.getparent()
+                    if ext_parent is not None:
+                        ext_parent.remove(ext)
+                    new_body_elements.append(ext)
+                    current_new_tbl = None
 
-        # --- 5. Appliquer le réordonnancement XML ---
-        tbl = table._tbl
-        # Retirer toutes les lignes mobiles du tableau
-        for row in all_rows[1:]:
-            tbl.remove(row._tr)
-        # Réinsérer dans le nouvel ordre
-        cursor_tr = all_rows[0]._tr
-        for row in new_rows_flat[1:]:
-            cursor_tr.addnext(row._tr)
-            cursor_tr = row._tr
+        # 8. Retirer les anciens tableaux 2-col (devenus vides après le move)
+        for tbl_elem in two_col_tbl_elements:
+            if tbl_elem.find(qn("w:tr")) is None:
+                tp = tbl_elem.getparent()
+                if tp is not None:
+                    tp.remove(tbl_elem)
+
+        # 9. Insérer le nouveau contenu entre pre_header et post_footer
+        if pre_header_elements:
+            cursor = pre_header_elements[-1]
+            for elem in new_body_elements:
+                cursor.addnext(elem)
+                cursor = elem
+        elif post_footer_elements:
+            first_post = post_footer_elements[0]
+            for elem in reversed(new_body_elements):
+                first_post.addprevious(elem)
+        else:
+            for elem in new_body_elements:
+                body.append(elem)
 
         return self
 
@@ -923,21 +1054,17 @@ class _TermSheetEditor:
         return None, None
 
     def _count_occurrences_in_table(self, table, target: str) -> int:
-        """Compte les occurrences du titre, en restant dans les tableaux 2-col.
+        """Compte les occurrences du titre dans un tableau 2-col.
 
-        Ne compte QUE les lignes qui ont 2 `<w:tc>` réels (titre + description
-        physiquement distincts). Les lignes fusionnées (1 tc, gridSpan=2)
-        servant d'en-tête sont ignorées.
+        Accepte les lignes 2-tc (titre dans `cells[0]`) ET les lignes 1-tc dont
+        la cellule unique vaut le titre ou commence par `titre :` (sections
+        fusionnées "Titre : description" dans une seule cellule).
         """
         if not self._is_two_col_table(table):
             return 0
         c = 0
         for row in table.rows:
-            if (
-                self._real_tc_count(row) == 2
-                and len(row.cells) >= 1
-                and self._normalize(row.cells[0].text) == target
-            ):
+            if self._row_title_matches(row, target):
                 c += 1
             for cell in row.cells:
                 for nested in cell.tables:
@@ -945,22 +1072,15 @@ class _TermSheetEditor:
         return c
 
     def _find_section_row_in_table(self, table, target: str, occurrence: int, count_so_far: int = 0):
-        """Cherche la n-ième ligne au titre demandé, en restant dans les tableaux 2-col.
+        """Cherche la n-ième ligne au titre demandé, dans un tableau 2-col.
 
-        Ne matche QUE les lignes à 2 `<w:tc>` réels, pour éviter de viser une
-        ligne d'en-tête fusionnée (où cells[0] et cells[1] désignent la même
-        cellule physique, ce qui provoquerait l'écrasement du titre par la
-        description).
+        Accepte les lignes 2-tc et 1-tc (cf. `_row_title_matches`).
         """
         if not self._is_two_col_table(table):
             return None
         count = count_so_far
         for row in table.rows:
-            if (
-                self._real_tc_count(row) == 2
-                and len(row.cells) >= 1
-                and self._normalize(row.cells[0].text) == target
-            ):
+            if self._row_title_matches(row, target):
                 count += 1
                 if count == occurrence:
                     return row
